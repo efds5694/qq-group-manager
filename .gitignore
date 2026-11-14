@@ -1,0 +1,11 @@
+config.json
+data/
+__pycache__/
+*.pyc
+.venv/
+.codebuddy/
+.env
+.env.*
+.pytest_cache/
+.coverage
+htmlcov/
