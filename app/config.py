@@ -31,6 +31,7 @@ DEFAULTS: dict[str, Any] = {
         "max_interval": 10.0,
     },
     "templates": [],
+    "filter_presets": [],
     "server": {"host": "127.0.0.1", "port": 8787},
 }
 
@@ -128,6 +129,7 @@ def public_view(config: dict) -> dict:
         "batch": config.get("batch", {}),
         "server": config.get("server", {}),
         "templates": config.get("templates", []),
+        "filter_presets": config.get("filter_presets", []),
     }
 
 

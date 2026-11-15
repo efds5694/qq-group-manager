@@ -708,6 +708,11 @@ svg { fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round
 
 @media (max-width: 720px) {
   .topbar { padding: 0 14px; }
+  .topbar { gap: 8px; }
+  .crumb-sub, .topbar-right .pill-group { display: none; }
+  .crumb > span:first-child { white-space: nowrap; }
+  .topbar-right { gap: 6px; }
+  .topbar-right .pill { max-width: 92px; }
   .pill { max-width: 110px; }
   .grid-2, .grid-3, .grid-4 { grid-template-columns: 1fr; }
   .page-head { align-items: flex-start; }

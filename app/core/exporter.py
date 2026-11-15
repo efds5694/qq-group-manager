@@ -12,7 +12,7 @@ import io
 FIELD_LABELS: dict[str, str] = {
     "qq": "QQ号",
     "nickname": "昵称",
-    "card": "群名片",
+    "card": "群昵称",
     "role": "身份",
     "level": "等级",
     "join_time": "加群时间",

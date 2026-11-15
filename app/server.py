@@ -17,7 +17,7 @@ from typing import Callable
 from .core.errors import AppError
 
 WEB_DIR = Path(__file__).resolve().parents[1] / "web"
-MAX_BODY = 1024 * 1024
+MAX_BODY = 8 * 1024 * 1024
 
 STATIC_TYPES = {
     ".html": "text/html; charset=utf-8",

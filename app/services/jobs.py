@@ -11,8 +11,10 @@ import random
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ..core import store
+from . import members
 
 MAX_ITEMS = 5000
 
@@ -34,6 +36,9 @@ class JobManager:
                 with self._lock:
                     self._jobs[job_id].update(status="failed", error="任务执行异常", finished_at=time.time())
             finally:
+                for gid in {str(task["params"]["group_id"]) for task in tasks
+                            if task["action"] == "set_group_card"}:
+                    members.expire(client, gid)
                 self._queue.task_done()
 
     # ------------------------------------------------------------- 创建任务
@@ -91,6 +96,9 @@ class JobManager:
 
         interval = job["interval"]
         retries = job["retries"]
+        if job["kind"] == "collect":
+            self._run_collection(job, tasks, cancel)
+            return
 
         for index, task in enumerate(tasks):
             if cancel.is_set():
@@ -165,6 +173,36 @@ class JobManager:
             }
 
         store.log_event("job_finished", **summary)
+
+    def _run_collection(self, job, tasks, cancel):
+        def run(task):
+            if cancel.is_set():
+                return None
+            started = time.perf_counter()
+            try:
+                task["run"]()
+                return True, "", int((time.perf_counter() - started) * 1000)
+            except Exception as exc:
+                return False, getattr(exc, "message", None) or str(exc), int((time.perf_counter() - started) * 1000)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(run, task): task for task in tasks}
+            for future in as_completed(futures):
+                result = future.result()
+                if result is None:
+                    continue
+                ok, message, elapsed = result
+                task = futures[future]
+                with self._lock:
+                    job["cursor"] += 1
+                    job["ok" if ok else "fail"] += 1
+                    if len(job["items"]) < MAX_ITEMS:
+                        job["items"].append({"seq": job["cursor"], "target": task["target"], "label": task["label"],
+                                             "action": task["action"], "ok": ok, "message": message[:200], "ms": elapsed})
+        with self._lock:
+            job["status"] = "canceled" if cancel.is_set() else "failed" if job["fail"] else "done"
+            job["finished_at"] = time.time()
+        store.log_event("collection_finished", job=job["id"], total=job["total"], ok=job["ok"], fail=job["fail"])
 
     # ------------------------------------------------------------- 查询与控制
     def get(self, job_id: str) -> dict:

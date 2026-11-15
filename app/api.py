@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import threading
 import time
+import csv
+import io
 
 from . import config as config_mod
-from .core import exporter, store
+from .core import exporter, store, fields
 from .core.errors import AppError
 from .onebot import adapters, probe
 from .onebot.client import OneBotClient
 from .server import Request, Response, Router
-from .services import cards, groups, groupsettings, jobs, members
+from .services import cards, groups, groupsettings, jobs, members, query, collection, presets, rename
 
 _STATE: dict = {"client": None, "key": None, "session": None}
 _LOCK = threading.RLock()
@@ -128,6 +130,119 @@ def api_config(request: Request):
     view["field_labels"] = exporter.FIELD_LABELS
     view["default_fields"] = exporter.DEFAULT_FIELDS
     return view
+
+
+def _query_data(spec):
+    session = _session()
+    client, _ = _active_client()
+    dataset = query.prepare(client, str(session["login"]["user_id"]), spec)
+    pending = query.pending_collection(client, dataset, spec)
+    return dataset, pending
+
+
+def api_query(request: Request):
+    dataset, pending = _query_data(request.body)
+    if pending:
+        return {"pending": True, "job": pending, "fields": dataset["fields"]}
+    return query.execute(dataset, request.body)
+
+
+def api_fields(request: Request):
+    from .core.filters import OPERATORS
+    return {"fields": fields.FIELDS, "operators": OPERATORS,
+            "group_columns": fields.GROUP_COLUMNS, "member_columns": fields.MEMBER_COLUMNS}
+
+
+def api_query_export(request: Request):
+    dataset, pending = _query_data(request.body)
+    if pending:
+        return {"pending": True, "job": pending}
+    result = query.execute(dataset, request.body, paginate=False)
+    definitions = {item["id"]: item for item in result["fields"]}
+    columns = result["columns"]
+    header = [definitions[key]["label"] for key in columns]
+    rows = [[item["display"][key] for key in columns] for item in result["items"]]
+    if dataset["entity"] == "people":
+        matrix_key = request.b("matrix_field", "member.card")
+        for group in result["groups"]:
+            header.append(f'{definitions.get(matrix_key, {}).get("label", matrix_key)}·{group["name"]}（{group["group_id"]}）')
+        for line, item in zip(rows, result["items"]):
+            memberships = {entry["group_id"]: entry for entry in item["memberships"]}
+            line.extend(memberships[group["group_id"]]["display"].get(matrix_key, "未提供")
+                        if group["group_id"] in memberships else "未加入" for group in result["groups"])
+    return _deliver(header, rows, "群务资料_" + time.strftime("%Y%m%d-%H%M"), request.b("format", "csv"))
+
+
+def api_presets(request: Request):
+    return presets.catalog(_config())
+
+
+def api_save_preset(request: Request):
+    with _LOCK:
+        cfg = _config()
+        saved = presets.save(cfg, request.body)
+        config_mod.save(cfg)
+    return {"preset": saved, **presets.catalog(cfg)}
+
+
+def api_delete_preset(request: Request, preset_id: str):
+    with _LOCK:
+        cfg = _config()
+        presets.delete(cfg, preset_id)
+        config_mod.save(cfg)
+    return presets.catalog(cfg)
+
+
+def api_collect(request: Request):
+    session = _session()
+    client, _ = _active_client()
+    spec = {"entity": "memberships", "scope": {"group_ids": request.b("group_ids") or []}}
+    dataset = query.prepare(client, str(session["login"]["user_id"]), spec)
+    return {"job": collection.submit(client, dataset["entries"], dataset["ids"],
+                                     retry_failed=bool(request.b("retry_failed")))}
+
+
+def api_rename_preview(request: Request):
+    spec = request.b("query") or {}
+    spec = {**spec, "refresh": True}
+    dataset, pending = _query_data(spec)
+    if pending:
+        return {"pending": True, "job": pending}
+    return rename.preview(dataset, {**request.body, "query": spec}, str(_session()["login"]["user_id"]),
+                          interval=_interval(request.b("interval")))
+
+
+def api_rename_import(request: Request):
+    text = request.b("text", "")
+    if not isinstance(text, str):
+        raise AppError("名单内容必须是 CSV 文本")
+    result = {}
+    for index, row in enumerate(csv.reader(io.StringIO(text.lstrip("\ufeff"))), 1):
+        if not row or not any(row):
+            continue
+        if index == 1 and row[0].strip().lower() in ("qq", "qq号", "user_id"):
+            continue
+        if len(row) < 2 or not row[0].strip().isdigit() or not row[1].strip():
+            raise AppError(f"名单第 {index} 行无效", hint="每行需要 QQ号、新群昵称 两列。")
+        result[row[0].strip()] = row[1].strip()
+    if not result:
+        raise AppError("名单中没有有效成员")
+    return {"mapping": result, "count": len(result)}
+
+
+def api_preferences(request: Request):
+    raw = request.b("batch") or {}
+    batch = dict(_config().get("batch", {}))
+    try:
+        batch["interval"] = max(0.8, min(10, float(raw.get("interval", batch.get("interval", 2)))))
+        batch["retries"] = max(0, min(5, int(raw.get("retries", batch.get("retries", 2)))))
+        batch["trial_size"] = max(1, min(100, int(raw.get("trial_size", batch.get("trial_size", 10)))))
+    except (TypeError, ValueError):
+        raise AppError("运行参数格式错误")
+    cfg = _config()
+    cfg["batch"] = batch
+    config_mod.save(cfg)
+    return api_config(request)
 
 
 def api_save_profile(request: Request):
@@ -281,47 +396,80 @@ def api_export_groups(request: Request):
     return _deliver(header, rows, filename, fmt, sheet_title="群成员汇总")
 
 
-# ------------------------------------------------------------------ 共同群成员
-def _common_context(request: Request) -> tuple[list[str], dict, dict, dict]:
-    ids = _group_ids(request.q("groups"))
-    if len(ids) < 2:
-        raise AppError("至少选择两个群", hint="共同成员需要对比两个及以上群聊。")
+# ------------------------------------------------------------------ 跨群成员
+def _cross_context(ids: list[str], *, force: bool = False, show_remark: bool = True):
+    if not ids:
+        raise AppError("请至少选择一个群")
     session = _session()
     client, _ = _active_client()
-    entries, errors = members.fetch_many(client, ids, force=request.q("refresh") == "1")
+    all_groups = groups.list_groups(client, session["login"]["user_id"])
+    group_map = {group["group_id"]: group for group in all_groups}
+    missing = [gid for gid in ids if gid not in group_map]
+    if missing:
+        raise AppError("部分群已不在当前账号的群列表中", hint="群号：" + "、".join(missing) + "。请重新选群。")
+    group_map = {gid: {**group_map[gid], "group_name":
+                 (group_map[gid].get("group_remark") if show_remark else "") or group_map[gid]["group_name"]}
+                 for gid in ids}
+    entries, errors = members.fetch_many(client, ids, force=force)
     if errors:
-        failed = "、".join(errors.keys())
-        raise AppError(
-            f"有 {len(errors)} 个群拉取成员失败",
-            hint=f"失败的群：{failed}。确认账号仍在群内，或稍后重试。",
-        )
-    names = {item["group_id"]: item["group_name"] for item in groups.list_groups(client, session["login"]["user_id"])}
+        failed = "、".join(f'{group_map[gid]["group_name"]}（{gid}）' for gid in errors)
+        raise AppError(f"有 {len(errors)} 个群拉取成员失败",
+                       hint=f"失败的群：{failed}。本次结果未展示，请重试或重新选群。")
+    return entries, group_map, session, client
+
+
+def _common_options(values: dict) -> dict:
+    return {
+        "keyword": values.get("q", ""),
+        "source_groups": _group_ids(values.get("source_groups", "")),
+        "mode": values.get("mode", "all"),
+        "in_groups": _group_ids(values.get("in_groups", "")),
+        "not_in_groups": _group_ids(values.get("not_in_groups", "")),
+        "status": values.get("status", "all"),
+        "sort": values.get("sort", "count"),
+        "selected": _group_ids(values["selected"]) if "selected" in values else None,
+    }
+
+
+def _common_context(request: Request) -> tuple[list[str], dict, dict, dict]:
+    ids = _group_ids(request.q("groups"))
+    entries, group_map, session, _ = _cross_context(
+        ids, force=request.q("refresh") == "1", show_remark=request.q("show_remark", "1") != "0")
+    names = {gid: group_map[gid]["group_name"] for gid in ids}
     return ids, entries, names, session
 
 
 def api_members_common(request: Request):
     _, entries, names, _ = _common_context(request)
-    return members.common_members(entries, names, keyword=request.q("q"))
+    try:
+        page = max(1, int(request.q("page", "1")))
+    except ValueError:
+        raise AppError("页码必须是整数")
+    return members.common_members(entries, names, page=page,
+                                  **_common_options({key: value[0] for key, value in request.query.items()}))
 
 
 def api_export_common(request: Request):
     ids, entries, names, _ = _common_context(request)
-    result = members.common_members(entries, names, keyword=request.q("q"))
+    result = members.common_members(entries, names, size=None,
+                                   **_common_options({key: value[0] for key, value in request.query.items()}))
     fmt = request.q("format", "csv")
 
-    header = ["QQ号", "昵称", "共同群数"]
+    header = ["QQ号", "QQ昵称", "所在群数", "参考群昵称", "来源群", "来源群昵称不同"]
     for group in result["groups"]:
         label = f"{group['group_name']}（{group['group_id']}）"
-        header.extend([f"群名片·{label}", f"身份·{label}", f"加群时间·{label}"])
+        header.extend([f"是否加入·{label}", f"群昵称·{label}", f"身份·{label}", f"加群时间·{label}"])
 
     rows: list[list[str]] = []
     for item in result["items"]:
-        line = [item["qq"], item["nickname"], str(item["count"])]
+        line = [item["qq"], item["nickname"], str(item["count"]), item["reference_card"],
+                names.get(item["source_group_id"], ""), "是" if item["source_conflict"] else "否"]
         for group in result["groups"]:
             info = item["groups"].get(group["group_id"]) or {}
             line.extend(
                 [
-                    info.get("card") or info.get("display_name") or "",
+                    "已加入" if info else "未加入",
+                    info.get("card") or "",
                     info.get("role_label") or "",
                     info.get("join_time") or "",
                 ]
@@ -329,11 +477,114 @@ def api_export_common(request: Request):
         rows.append(line)
 
     stamp = time.strftime("%Y%m%d-%H%M")
-    filename = f"共同群成员_{len(ids)}个群_{stamp}"
-    return _deliver(header, rows, filename, fmt, sheet_title="共同群成员")
+    filename = f"跨群成员_{len(ids)}个群_{stamp}"
+    return _deliver(header, rows, filename, fmt, sheet_title="跨群成员")
 
 
-# ------------------------------------------------------------------ 批量改名片
+def _sync_ids(request: Request) -> tuple[list[str], list[str]]:
+    def ids(key):
+        value = request.b(key) or []
+        if not isinstance(value, list):
+            raise AppError("群列表格式错误")
+        return list(dict.fromkeys(str(gid) for gid in value if gid))
+    sources, targets = ids("source_group_ids"), ids("target_group_ids")
+    if not sources or not targets:
+        raise AppError("请选择基准群和目标群")
+    if set(sources).intersection(targets):
+        raise AppError("基准群只作为来源，请从目标群中移除重复的群")
+    return sources, targets
+
+
+def api_cards_sync_preview(request: Request):
+    sources, targets = _sync_ids(request)
+    entries, group_map, session, _ = _cross_context(
+        sources + targets, force=True, show_remark=request.b("show_remark", True))
+    options = _common_options(request.b("filters") or {})
+    options["source_groups"] = sources
+    result = members.common_members(entries, {gid: group["group_name"] for gid, group in group_map.items()},
+                                    size=None, **options)
+    if not result["items"]:
+        raise AppError("当前范围没有成员", hint="调整筛选或重新勾选成员后预演。")
+    return cards.preview_sync(result["items"], entries, group_map, targets, str(session["login"]["user_id"]),
+                              only_empty=bool(request.b("only_empty")), interval=_interval(request.b("interval")))
+
+
+def api_cards_sync_execute(request: Request):
+    sources, targets = _sync_ids(request)
+    reviewed = request.b("items")
+    if not isinstance(reviewed, list) or not reviewed:
+        raise AppError("请先预演并确认需要修改的群昵称")
+    pairs = set()
+    for item in reviewed:
+        if (not isinstance(item, dict) or item.get("group_id") not in targets
+                or not isinstance(item.get("qq"), str) or not item["qq"]
+                or not isinstance(item.get("new_card"), str) or not item["new_card"].strip()
+                or item.get("source_group_id") not in sources):
+            raise AppError("预演内容不完整，请重新预演")
+        pair = (item["group_id"], item["qq"])
+        if pair in pairs:
+            raise AppError("预演内容有重复目标，请重新预演")
+        pairs.add(pair)
+    return _execute_card_items(request, reviewed, targets)
+
+
+
+def api_rename_execute(request: Request):
+    reviewed = request.b("items")
+    targets = request.b("target_group_ids")
+    if not isinstance(reviewed, list) or not reviewed or not isinstance(targets, list) or not targets:
+        raise AppError("请先预演群昵称修改")
+    pairs = set()
+    for item in reviewed:
+        if (not isinstance(item, dict) or item.get("group_id") not in targets
+                or not isinstance(item.get("qq"), str) or not item["qq"]
+                or not isinstance(item.get("new_card"), str) or not item["new_card"].strip()):
+            raise AppError("预演内容不完整，请重新预演")
+        pair = (item["group_id"], item["qq"])
+        if pair in pairs:
+            raise AppError("预演内容有重复目标")
+        pairs.add(pair)
+    return _execute_card_items(request, reviewed, list(dict.fromkeys(targets)))
+
+def _execute_card_items(request, reviewed, targets):
+    mode = request.b("mode", "trial")
+    if mode not in ("trial", "full"):
+        raise AppError("执行模式无效")
+    if mode == "trial":
+        reviewed = reviewed[:int(_config().get("batch", {}).get("trial_size", 10))]
+    elif len(reviewed) > 100 and not request.b("confirmed"):
+        raise AppError(f"本次将修改 {len(reviewed)} 条群昵称", hint="超过 100 条需要二次确认。")
+
+    # 执行只重查目标群；新群昵称取自预演，不随来源群后续变化而改变。
+    entries, group_map, session, client = _cross_context(
+        targets, force=True, show_remark=request.b("show_remark", True))
+    interval = _interval(request.b("interval"))
+    plan = cards.preview_sync([], entries, group_map, targets, str(session["login"]["user_id"]),
+                              only_empty=bool(request.b("only_empty")), interval=interval, reviewed=reviewed)
+    if not plan["items"]:
+        raise AppError("没有可执行的修改", hint="目标成员或群昵称可能已变化，请重新预演。")
+    snapshots, tasks = [], []
+    title = f'{"试改" if mode == "trial" else "批量改"}群昵称 · {plan["stats"]["people"]} 人 / {len(plan["items"])} 条'
+    for gid in targets:
+        items = [item for item in plan["items"] if item["group_id"] == gid]
+        if not items:
+            continue
+        snapshot = store.save_snapshot("cards", gid, {
+            "group_name": group_map[gid]["group_name"],
+            "members": [{"qq": item["qq"], "card": item["old_card"], "nickname": item["nickname"]}
+                        for item in items],
+        }, note=title)
+        snapshots.append(snapshot)
+        for task in cards.build_tasks(items, gid):
+            task["label"] = f'{group_map[gid]["group_name"]} · {task["label"]}'
+            tasks.append(task)
+    job = jobs.MANAGER.submit(client, "card", tasks, title=title, interval=interval,
+                              retries=int(_config().get("batch", {}).get("retries", 2)),
+                              meta={"group_ids": targets, "snapshot_ids": [snap["id"] for snap in snapshots]})
+    return {"job": job, "snapshots": snapshots, "planned": len(tasks), "skipped": plan["stats"]["skip"]}
+
+
+# ------------------------------------------------------------------ 批量改群昵称
 def api_cards_preview(request: Request):
     gid = str(request.b("group_id") or "")
     if not gid:
@@ -369,7 +620,7 @@ def api_cards_execute(request: Request):
 
     items = plan["items"]
     if not items:
-        raise AppError("没有需要修改的成员", hint="检查模板与作用范围，或成员名片本来就一致。")
+        raise AppError("没有需要修改的成员", hint="检查模板与作用范围，或成员群昵称本来就一致。")
 
     if mode == "trial":
         limit = int(_config().get("batch", {}).get("trial_size", 10))
@@ -381,7 +632,7 @@ def api_cards_execute(request: Request):
                 f"本次将修改 {len(items)} 人",
                 hint="全量执行超过 100 人需要二次确认，请勾选确认后重试。",
             )
-        title = f"批量改名片 {len(items)} 人 · {ctx['group']['group_name']}"
+        title = f"批量改群昵称 {len(items)} 人 · {ctx['group']['group_name']}"
 
     snapshot = store.save_snapshot(
         "cards",
@@ -489,7 +740,7 @@ def api_snapshots(request: Request):
 def api_rollback(request: Request, snapshot_id: str):
     snapshot = store.load_snapshot(snapshot_id)
     if snapshot.get("kind") != "cards":
-        raise AppError("该快照不支持回滚", hint="只有改名片快照可以回滚。")
+        raise AppError("该快照不支持回滚", hint="只有改群昵称快照可以回滚。")
     group_id = str(snapshot.get("group_id") or "")
     entries = snapshot.get("members") or []
     if not entries:
@@ -502,7 +753,7 @@ def api_rollback(request: Request, snapshot_id: str):
         client,
         "rollback",
         task_list,
-        title=f"回滚名片 · {snapshot.get('group_name') or group_id} · {len(task_list)} 人",
+        title=f"回滚群昵称 · {snapshot.get('group_name') or group_id} · {len(task_list)} 人",
         interval=interval,
         retries=int(_config().get("batch", {}).get("retries", 2)),
         meta={"group_id": group_id, "snapshot_id": snapshot_id},
@@ -532,8 +783,19 @@ def api_delete_template(request: Request, template_id: str):
 # ------------------------------------------------------------------ 路由表
 def build_router() -> Router:
     router = Router()
+    router.add("POST", r"^/api/query$", api_query)
+    router.add("POST", r"^/api/query/export$", api_query_export)
+    router.add("GET", r"^/api/fields$", api_fields)
+    router.add("GET", r"^/api/filter-presets$", api_presets)
+    router.add("POST", r"^/api/filter-presets$", api_save_preset)
+    router.add("DELETE", r"^/api/filter-presets/(?P<preset_id>[^/]+)$", api_delete_preset)
+    router.add("POST", r"^/api/data/collect$", api_collect)
+    router.add("POST", r"^/api/rename/preview$", api_rename_preview)
+    router.add("POST", r"^/api/rename/execute$", api_rename_execute)
+    router.add("POST", r"^/api/rename/import$", api_rename_import)
     router.add("GET", r"^/api/config$", api_config)
     router.add("POST", r"^/api/config/profile$", api_save_profile)
+    router.add("POST", r"^/api/config/preferences$", api_preferences)
     router.add("POST", r"^/api/connect$", api_connect)
     router.add("GET", r"^/api/capabilities$", api_capabilities)
 
@@ -548,6 +810,8 @@ def build_router() -> Router:
 
     router.add("POST", r"^/api/cards/preview$", api_cards_preview)
     router.add("POST", r"^/api/cards/execute$", api_cards_execute)
+    router.add("POST", r"^/api/cards/sync/preview$", api_cards_sync_preview)
+    router.add("POST", r"^/api/cards/sync/execute$", api_cards_sync_execute)
 
     router.add("POST", r"^/api/settings/preview$", api_settings_preview)
     router.add("POST", r"^/api/settings/execute$", api_settings_execute)

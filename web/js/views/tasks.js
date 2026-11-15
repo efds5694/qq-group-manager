@@ -7,7 +7,7 @@ import {
   toast, esc, openDrawer, closeDrawer, confirmAction, statusTag, fmtDuration, fmtNumber, emptyState,
 } from '../ui.js';
 
-const KIND_LABEL = { card: '批量改名', settings: '群设置', rollback: '回滚' };
+const KIND_LABEL = { card: '改群昵称', settings: '群设置', rollback: '群昵称回滚', collect: '资料补全' };
 
 function jobCard(job) {
   const total = job.total || 1;
@@ -49,6 +49,7 @@ async function showJob(jobId) {
           <div class="stat"><span class="label">状态</span><span class="value" style="font-size:14px">${statusTag(job.status)}</span></div>
         </div>
         ${job.meta?.snapshot_id ? `<div class="hint-box"><span class="hint-icon">i</span><div>本次操作快照：<span class="mono">${esc(job.meta.snapshot_id)}</span>，可在下方快照列表回滚。</div></div>` : ''}
+        ${job.meta?.snapshot_ids?.length ? `<div class="hint-box"><span class="hint-icon">i</span><div>本次操作按目标群保存了 ${job.meta.snapshot_ids.length} 份快照，可在快照列表分别回滚：<br>${job.meta.snapshot_ids.map(id => `<span class="mono">${esc(id)}</span>`).join('<br>')}</div></div>` : ''}
         ${
           items.length
             ? `<div class="table-wrap" style="max-height:420px;border:1px solid var(--line)">
@@ -117,7 +118,7 @@ export async function render(root) {
           </div>
 
           <div class="card">
-            <div class="card-head"><h3>快照</h3><span class="sub">改名片前的原始名片</span></div>
+            <div class="card-head"><h3>快照</h3><span class="sub">改群昵称前的原始群昵称</span></div>
             <div class="card-body" id="snapshot-list" style="display:flex;flex-direction:column;gap:8px">
               <div class="skeleton" style="height:60px"></div>
             </div>
@@ -179,8 +180,8 @@ export async function render(root) {
       snapList.querySelectorAll('[data-rollback]').forEach((node) => {
         node.addEventListener('click', async () => {
           const ok = await confirmAction({
-            title: '确认回滚名片',
-            message: '将把快照里的成员名片逐个恢复为改动前的值。',
+            title: '确认回滚群昵称',
+            message: '将把快照里的成员群昵称逐个恢复为改动前的值。',
             hint: '回滚同样受速率限制，人数较多时需要较长时间。',
             confirmText: '开始回滚',
             danger: true,

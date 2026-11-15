@@ -20,7 +20,7 @@ from ..core import store
 from ..core.errors import AppError, UnsupportedAction
 from .members import ROLE_LABELS
 
-_CACHE: dict[str, dict] = {}
+_CACHE: dict[tuple[str, str], dict] = {}
 _LOCK = threading.Lock()
 TTL = 120
 
@@ -100,10 +100,13 @@ def _fetch_roles(client, group_ids: list[str], self_id: str) -> dict[str, str]:
     return result
 
 
-def _group_remark(client, group_id: str) -> tuple[str | None, bool]:
+def _group_remark(client, group_id: str, force: bool = False) -> tuple[str | None, bool]:
     """返回 (备注, 是否支持该字段)。None 表示这次没拿到，不写缓存。"""
     try:
-        info = client.call("get_group_info", group_id=group_id, timeout=10) or {}
+        from . import collection
+        cached = collection.load(client, group_id).get("group", {}).get("get_group_info", {})
+        info = cached["data"] if cached.get("status") == "ok" and not force else collection.fetch(client, group_id, "get_group_info")
+        info = info or {}
     except UnsupportedAction:
         return None, False
     except AppError:
@@ -116,7 +119,7 @@ def _group_remark(client, group_id: str) -> tuple[str | None, bool]:
     return None, True
 
 
-def _fetch_remarks(client, group_ids: list[str], meta: dict) -> bool:
+def _fetch_remarks(client, group_ids: list[str], meta: dict, force: bool = False) -> bool:
     """并发补群备注，返回协议端是否提供备注字段。"""
     if not group_ids:
         return True
@@ -126,7 +129,7 @@ def _fetch_remarks(client, group_ids: list[str], meta: dict) -> bool:
     hits = 0
 
     def one(gid: str):
-        return gid, *_group_remark(client, gid)
+        return gid, *_group_remark(client, gid, force)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for gid, remark, ok in pool.map(one, group_ids):
@@ -139,14 +142,12 @@ def _fetch_remarks(client, group_ids: list[str], meta: dict) -> bool:
             with _META_LOCK:
                 meta["remarks"][gid] = remark
 
-    if group_ids and hits == 0:
-        supported = False
     return supported
 
 
-def _apply_remarks(remarks: dict[str, str]) -> None:
+def _apply_remarks(remarks: dict[str, str], key: tuple[str, str]) -> None:
     with _LOCK:
-        cached = _CACHE.get("all")
+        cached = _CACHE.get(key)
     if not cached:
         return
     for group in cached["groups"]:
@@ -160,17 +161,17 @@ def fetch_remarks(client, self_id: str, group_ids: list[str], force: bool = Fals
         return {}, False
 
     meta = _meta(self_id)
-    if not meta["remarks_supported"]:
+    if not meta["remarks_supported"] and not force:
         return {gid: remark for gid, remark in meta["remarks"].items() if gid in set(ids) and remark}, False
 
     pending = [gid for gid in ids if force or gid not in meta["remarks"]]
     if pending:
-        supported = _fetch_remarks(client, pending, meta)
+        supported = _fetch_remarks(client, pending, meta, force)
         if not supported:
             with _META_LOCK:
                 meta["remarks_supported"] = False
         _save_meta(self_id, meta)
-        _apply_remarks(meta["remarks"])
+        _apply_remarks(meta["remarks"], (client.cache_namespace, str(self_id)))
 
     allowed = set(ids)
     return (
@@ -181,8 +182,12 @@ def fetch_remarks(client, self_id: str, group_ids: list[str], force: bool = Fals
 
 def list_groups(client, self_id: str = "", force: bool = False) -> list[dict]:
     now = time.time()
+    key = (client.cache_namespace, str(self_id))
     with _LOCK:
-        cached = _CACHE.get("all")
+        cached = _CACHE.get(key)
+
+    if not cached and not force:
+        cached = store.read_json(store.CACHE_DIR / f"groups-{client.cache_namespace}.json")
 
     if cached and not force and now - cached["at"] < TTL:
         return cached["groups"]
@@ -193,7 +198,7 @@ def list_groups(client, self_id: str = "", force: bool = False) -> list[dict]:
     ids = [str(item.get("group_id")) for item in infos]
     meta = _meta(self_id)
     roles = dict(meta["roles"])
-    missing = [gid for gid in ids if force or gid not in roles]
+    missing = [gid for gid in ids if force or not roles.get(gid)]
 
     if missing and self_id:
         roles.update(_fetch_roles(client, missing, self_id))
@@ -223,6 +228,9 @@ def list_groups(client, self_id: str = "", force: bool = False) -> list[dict]:
         role = roles.get(group_id) or ""
         groups.append(
             {
+                **item,
+                "raw": {"get_group_list": dict(item)},
+                "fetched_at": now,
                 "group_id": group_id,
                 "group_name": (item.get("group_name") or group_id).strip(),
                 "group_remark": meta["remarks"].get(group_id, ""),
@@ -236,7 +244,8 @@ def list_groups(client, self_id: str = "", force: bool = False) -> list[dict]:
 
     groups.sort(key=lambda entry: -entry["member_count"])
     with _LOCK:
-        _CACHE["all"] = {"at": now, "groups": groups}
+        _CACHE[key] = {"at": now, "groups": groups}
+    store.write_json(store.CACHE_DIR / f"groups-{client.cache_namespace}.json", {"at": now, "groups": groups})
     return groups
 
 

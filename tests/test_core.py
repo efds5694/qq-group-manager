@@ -15,6 +15,12 @@ class TemplateTests(unittest.TestCase):
         self.assertEqual(template.clamp('  张三四五  ', 3), ('张三四', True))
         self.assertEqual(template.clamp('张三', 3), ('张三', False))
 
+    def test_clamp_does_not_leave_whitespace_at_cutoff(self):
+        value, clamped = template.clamp('张三 后缀', 3)
+        self.assertTrue(clamped)
+        self.assertEqual(value, '张三')
+        self.assertEqual(template.clamp(value, 3)[0], value)
+
 
 class ExportTests(unittest.TestCase):
     def test_csv_unicode_quoting_and_formula_protection(self):

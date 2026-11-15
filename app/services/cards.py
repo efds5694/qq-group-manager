@@ -1,4 +1,4 @@
-"""批量改名片：预演计划 + 任务构建 + 回滚。
+"""批量改群昵称：预演计划 + 任务构建 + 回滚。
 
 预演是纯本地计算，一个写请求都不发。
 只有用户确认后，api 层才会把计划转成任务提交给 JobManager。
@@ -12,7 +12,7 @@ from ..core.errors import AppError
 SCOPE_LABELS = {
     "all": "全部成员",
     "selected": "已勾选成员",
-    "empty_card": "仅空名片",
+    "empty_card": "仅空群昵称",
     "role": "按身份",
     "year": "按入群年份",
     "mapping": "按导入名单",
@@ -47,9 +47,9 @@ def _can_edit(member: dict, self_id: str, self_role: str) -> str:
     """返回空字符串表示可以改，否则返回跳过原因。"""
     role = member["role"]
     if role == "owner":
-        return "群主名片不可修改"
+        return "群主群昵称不可修改"
     if member["qq"] == str(self_id) and self_role == "owner":
-        return "群主无法修改自己的名片"
+        return "群主无法修改自己的群昵称"
     if self_role == "admin" and role == "admin":
         return "管理员无法修改同级管理员"
     if self_role not in ("owner", "admin"):
@@ -73,7 +73,7 @@ def preview(
     scope = options.get("scope") or "all"
 
     if scope != "mapping" and not template:
-        raise AppError("没有填写名片模板", hint="例如 {nickname}-2026")
+        raise AppError("没有填写群昵称模板", hint="例如 {nickname}-2026")
 
     unknown = tpl.unknown_vars(template)
     warnings: list[str] = []
@@ -98,8 +98,8 @@ def preview(
         if scope == "mapping":
             new_card = str(mapping.get(member["qq"], "") or "").strip()
             if not new_card:
-                skipped.append({"qq": member["qq"], "display_name": member["display_name"], "reason": "导入名单里没有对应名片"})
-                reasons["导入名单里没有对应名片"] = reasons.get("导入名单里没有对应名片", 0) + 1
+                skipped.append({"qq": member["qq"], "display_name": member["display_name"], "reason": "导入名单里没有对应群昵称"})
+                reasons["导入名单里没有对应群昵称"] = reasons.get("导入名单里没有对应群昵称", 0) + 1
                 continue
         else:
             context = tpl.build_context(member, group, index)
@@ -113,8 +113,8 @@ def preview(
             reasons["模板渲染结果为空"] = reasons.get("模板渲染结果为空", 0) + 1
             continue
         if new_card == member["card"]:
-            skipped.append({"qq": member["qq"], "display_name": member["display_name"], "reason": "名片一致，无需修改"})
-            reasons["名片一致，无需修改"] = reasons.get("名片一致，无需修改", 0) + 1
+            skipped.append({"qq": member["qq"], "display_name": member["display_name"], "reason": "群昵称一致，无需修改"})
+            reasons["群昵称一致，无需修改"] = reasons.get("群昵称一致，无需修改", 0) + 1
             continue
 
         items.append(
@@ -132,7 +132,7 @@ def preview(
     if clamped_count:
         warnings.append(f"有 {clamped_count} 人的结果超过 {tpl.CARD_MAX_LEN} 字符，已自动截断。")
     if self_role == "admin":
-        warnings.append("你是管理员：只能修改普通成员的名片，群主与其他管理员会被跳过。")
+        warnings.append("你是管理员：只能修改普通成员的群昵称，群主与其他管理员会被跳过。")
 
     samples = [
         {
@@ -174,6 +174,73 @@ def build_tasks(plan_items: list[dict], group_id: str) -> list[dict]:
     ]
 
 
+def preview_sync(
+    rows: list[dict],
+    entries: dict[str, dict],
+    group_map: dict[str, dict],
+    target_ids: list[str],
+    self_id: str,
+    *,
+    only_empty: bool = False,
+    interval: float = 2.0,
+    reviewed: list[dict] | None = None,
+) -> dict:
+    """将参考群昵称转换成逐群 mapping，沿用单群权限、截断与差异判断。
+
+    reviewed 用于执行阶段：只重查已预演的目标，保留用户看过的新群昵称。
+    """
+    items, skipped, warnings = [], [], []
+    for gid in target_ids:
+        group = group_map[gid]
+        member_list = entries[gid]["members"]
+        member_map = {member["qq"]: member for member in member_list}
+        myself = member_map.get(str(self_id)) or {}
+        self_role = myself.get("role") or group.get("my_role") or "member"
+        candidates = ([item for item in reviewed if item["group_id"] == gid]
+                      if reviewed is not None else rows)
+        mapping, sources = {}, {}
+        for row in candidates:
+            qq = row["qq"]
+            member = member_map.get(qq)
+            new_card = row.get("new_card") if reviewed is not None else row["reference_card"]
+            reason = ""
+            if not member:
+                reason = "未加入目标群"
+            elif not new_card:
+                reason = "没有非空参考群昵称"
+            elif only_empty and member["card"]:
+                reason = "目标群已有群昵称（只补空群昵称）"
+            if reason:
+                skipped.append({"group_id": gid, "group_name": group["group_name"],
+                                "qq": qq, "display_name": row.get("nickname") or qq, "reason": reason})
+                continue
+            mapping[qq] = new_card
+            sources[qq] = row.get("source_group_id", "")
+
+        plan = preview(member_list, group, {"scope": "mapping", "mapping": mapping},
+                       self_id, self_role, interval)
+        for item in plan["items"]:
+            item.update(group_id=gid, group_name=group["group_name"], source_group_id=sources[item["qq"]])
+        for item in plan["skipped"]:
+            item.update(group_id=gid, group_name=group["group_name"])
+        items.extend(plan["items"])
+        skipped.extend(plan["skipped"])
+        warnings.extend(f'{group["group_name"]}：{warning}' for warning in plan["warnings"])
+
+    reasons: dict[str, int] = {}
+    for item in skipped:
+        reasons[item["reason"]] = reasons.get(item["reason"], 0) + 1
+    return {
+        "items": items,
+        "skipped": skipped,
+        "warnings": warnings,
+        "stats": {"change": len(items), "people": len({item["qq"] for item in items}),
+                  "skip": len(skipped), "reasons": reasons},
+        "interval": interval,
+        "eta_seconds": int(len(items) * interval),
+    }
+
+
 def build_rollback_tasks(snapshot: dict, group_id: str) -> list[dict]:
     entries = snapshot.get("members") or []
     tasks = []
@@ -185,7 +252,7 @@ def build_rollback_tasks(snapshot: dict, group_id: str) -> list[dict]:
         tasks.append(
             {
                 "target": qq,
-                "label": f"{qq} 恢复为「{card or '空名片'}」",
+                "label": f"{qq} 恢复为「{card or '空群昵称'}」",
                 "action": "set_group_card",
                 "params": {"group_id": str(group_id), "user_id": qq, "card": card},
             }

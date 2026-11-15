@@ -1,18 +1,19 @@
-// 极简 hash 路由，单独成模块避免视图与 app.js 循环依赖
+import { state } from './state.js';
 
-const ROUTES = ['connect', 'groups', 'members', 'cards', 'settings', 'tasks'];
+const ROUTES = ['groups', 'members', 'tasks', 'preferences'];
+const ALIASES = { connect: 'preferences', settings: 'groups', cards: 'members', 'cross-members': 'members' };
 
 export function currentRoute() {
   const raw = (window.location.hash || '').replace(/^#\/?/, '').split('?')[0];
-  return ROUTES.includes(raw) ? raw : 'connect';
+  if (raw === 'cross-members') state.workbenchMode = 'people';
+  if (raw === 'cards') state.pendingRename = true;
+  if (raw === 'settings') state.pendingGroupSettings = true;
+  return ALIASES[raw] || (ROUTES.includes(raw) ? raw : state.connected ? 'groups' : 'preferences');
 }
 
 export function navigate(name) {
-  if (!ROUTES.includes(name)) name = 'connect';
-  const target = `#/${name}`;
-  if (window.location.hash === target) {
-    window.dispatchEvent(new HashChangeEvent('hashchange'));
-    return;
-  }
-  window.location.hash = target;
+  const route = ALIASES[name] || (ROUTES.includes(name) ? name : 'preferences');
+  const target = `#/${route}`;
+  if (window.location.hash === target) window.dispatchEvent(new HashChangeEvent('hashchange'));
+  else window.location.hash = target;
 }

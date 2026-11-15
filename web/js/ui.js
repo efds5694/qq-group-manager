@@ -32,9 +32,10 @@ const drawerTitle = document.getElementById('drawer-title');
 const drawerBody = document.getElementById('drawer-body');
 const drawerFoot = document.getElementById('drawer-foot');
 
-export function openDrawer({ title, body, footer = '', onMount }) {
+export function openDrawer({ title, body, footer = '', onMount, wide = false }) {
   if (!drawer) return;
   drawerTitle.textContent = title;
+  drawer.querySelector('.drawer-panel').classList.toggle('drawer-wide', wide);
   drawerBody.innerHTML = body;
   drawerFoot.innerHTML = footer;
   drawer.setAttribute('aria-hidden', 'false');

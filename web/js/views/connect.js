@@ -18,7 +18,7 @@ const NAPCAT_HINT = `
 function capabilityChips(caps) {
   const items = [
     ['群列表 / 成员', true],
-    ['批量改名片', true],
+    ['批量改群昵称', true],
     ['群公告', caps?.notice],
     ['群头像', caps?.portrait],
     ['加群方式', caps?.add_option],

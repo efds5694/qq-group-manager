@@ -1,4 +1,4 @@
-"""名片 / 群名模板渲染。
+"""群昵称 / 群名模板渲染。
 
 支持变量：{nickname} {card} {qq} {group_name} {index} {level} {join_year} {title}
 未知变量原样保留，并在预演阶段提示，避免用户以为变量生效了。
@@ -10,7 +10,7 @@ import re
 
 VAR_RE = re.compile(r"\{(\w+)\}")
 
-# QQ 群名片的长度上限。超过后协议端会报错或截断，这里提前拦住。
+# QQ 群昵称的长度上限。超过后协议端会报错或截断，这里提前拦住。
 CARD_MAX_LEN = 40
 GROUP_NAME_MAX_LEN = 30
 
@@ -23,6 +23,7 @@ ALLOWED_VARS = (
     "level",
     "join_year",
     "title",
+    "result",
 )
 
 
@@ -57,4 +58,4 @@ def clamp(text: str, limit: int) -> tuple[str, bool]:
     text = (text or "").strip()
     if len(text) <= limit:
         return text, False
-    return text[:limit], True
+    return text[:limit].rstrip(), True

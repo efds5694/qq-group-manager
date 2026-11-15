@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from ..core import store
 from ..core.errors import AppError
+from ..core.template import CARD_MAX_LEN, clamp
 
 ROLE_LABELS = {"owner": "群主", "admin": "管理员", "member": "成员"}
 ROLE_ORDER = {"owner": 0, "admin": 1, "member": 2}
@@ -27,7 +28,6 @@ DEFAULT_TTL = 300
 # 磁盘缓存超过这个时间就不先给旧数据了，直接等新数据（避免展示几天前的名单）
 STALE_OK = 6 * 3600
 MAX_WORKERS = 4
-COMMON_LIMIT = 5000
 
 
 def _fmt_time(timestamp) -> str:
@@ -58,6 +58,8 @@ def normalize(member: dict) -> dict:
     card = (member.get("card") or "").strip()
     nickname = (member.get("nickname") or "").strip()
     return {
+        **member,
+        "raw": {"get_group_member_list": dict(member)},
         "qq": qq,
         "nickname": nickname,
         "card": card,
@@ -110,8 +112,8 @@ def _save_disk(entry: dict, namespace: str) -> None:
         pass
 
 
-def _fetch_remote(client, group_id: str) -> dict:
-    raw = client.call("get_group_member_list", group_id=group_id, timeout=120)
+def _fetch_remote(client, group_id: str, force: bool = False) -> dict:
+    raw = client.call("get_group_member_list", group_id=group_id, timeout=120, **({"no_cache": True} if force else {}))
     if not isinstance(raw, list):
         raise AppError("成员列表返回格式异常", hint="协议端版本可能不兼容，检查 NapCat 是否为新版。")
 
@@ -166,7 +168,7 @@ def fetch(client, group_id: str, force: bool = False, ttl: int = DEFAULT_TTL) ->
             _refresh_async(client, group_id)
             return {**disk, "stale": True}
 
-    return _fetch_remote(client, group_id)
+    return _fetch_remote(client, group_id, force)
 
 
 def fetch_many(client, group_ids: list[str], force: bool = False) -> tuple[dict[str, dict], dict[str, Exception]]:
@@ -206,6 +208,16 @@ def invalidate(group_id: str | None = None) -> None:
 def cached(client, group_id: str) -> dict | None:
     with _LOCK:
         return _CACHE.get(_key(client, group_id))
+
+
+def expire(client, group_id: str) -> None:
+    """写任务结束后丢弃该连接的旧名单，下次读取直接获取真实结果。"""
+    with _LOCK:
+        _CACHE.pop(_key(client, group_id), None)
+    try:
+        _disk_path(group_id, client.cache_namespace).unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 # ------------------------------------------------------------------ 查询
@@ -286,14 +298,26 @@ def query(
     }
 
 
-# ------------------------------------------------------------------ 多群共同成员
+# ------------------------------------------------------------------ 跨群成员
 def common_members(
     entries: dict[str, dict],
     group_names: dict[str, str],
     keyword: str = "",
+    *,
+    source_groups: list[str] | None = None,
+    mode: str = "all",
+    in_groups: list[str] | None = None,
+    not_in_groups: list[str] | None = None,
+    status: str = "all",
+    selected: list[str] | None = None,
+    sort: str = "count",
+    page: int = 1,
+    size: int | None = 50,
 ) -> dict:
-    """求多个群的成员交集，附带每个人在每个群里的名片/身份。"""
+    """以 QQ 合并成员并集；查看、导出和同步预演共用同一套筛选。size=None 不分页。"""
     gids = list(entries.keys())
+    sources = list(dict.fromkeys(gid for gid in (source_groups or []) if gid in entries))
+    targets = [gid for gid in gids if gid not in sources]
     table: dict[str, dict] = {}
 
     for gid in gids:
@@ -311,7 +335,41 @@ def common_members(
                 "join_time": member["join_time"],
             }
 
-    rows = [row for row in table.values() if len(row["groups"]) == len(gids)]
+    rows = list(table.values())
+    for row in rows:
+        memberships = row["groups"]
+        references = [(gid, memberships[gid]["card"]) for gid in sources
+                      if gid in memberships and memberships[gid]["card"]]
+        row["count"] = len(memberships)
+        row["source_group_id"], row["reference_card"] = references[0] if references else ("", "")
+        row["source_conflict"] = len({card for _, card in references}) > 1
+        expected = clamp(row["reference_card"], CARD_MAX_LEN)[0]
+        row["different"] = bool(expected) and any(
+            gid in memberships and memberships[gid]["card"] != expected for gid in targets
+        )
+
+    counts = {
+        "all": len(rows),
+        "single": sum(row["count"] == 1 for row in rows),
+        "multiple": sum(row["count"] > 1 for row in rows),
+        "different": sum(row["different"] for row in rows),
+        "no_reference": sum(not row["reference_card"] for row in rows),
+    }
+    if mode == "multiple":
+        rows = [row for row in rows if row["count"] > 1]
+    elif mode == "single":
+        rows = [row for row in rows if row["count"] == 1]
+    elif mode == "intersection":
+        rows = [row for row in rows if row["count"] == len(gids)]
+    required, excluded = set(in_groups or []), set(not_in_groups or [])
+    rows = [row for row in rows if required.issubset(row["groups"]) and not excluded.intersection(row["groups"])]
+    if status == "different":
+        rows = [row for row in rows if row["different"]]
+    elif status == "no_reference":
+        rows = [row for row in rows if not row["reference_card"]]
+    if selected is not None:
+        chosen = set(selected)
+        rows = [row for row in rows if row["qq"] in chosen]
 
     text = (keyword or "").strip().lower()
     if text:
@@ -321,22 +379,35 @@ def common_members(
             if text in row["qq"]
             or text in (row["nickname"] or "").lower()
             or any(
-                text in (info.get("card") or "").lower() or text in (info.get("display_name") or "").lower()
+                text in (info.get("card") or "").lower() or text in (info.get("nickname") or "").lower()
                 for info in row["groups"].values()
             )
         ]
 
-    rows.sort(key=lambda item: int(item["qq"] or 0))
+    qq_key = lambda row: (len(row["qq"]), row["qq"])
+    rows.sort(key=qq_key)
+    if sort == "name":
+        rows.sort(key=lambda row: (row["reference_card"] or row["nickname"]).casefold())
+    elif sort != "qq":
+        rows.sort(key=lambda row: -row["count"])
     total = len(rows)
-    for row in rows:
-        row["count"] = len(row["groups"])
+    pages = max(1, (total + size - 1) // size) if size else 1
+    page = max(1, min(page, pages))
+    items = rows[(page - 1) * size:page * size] if size else rows
 
     return {
-        "items": rows[:COMMON_LIMIT],
+        "items": items,
         "total": total,
-        "truncated": total > COMMON_LIMIT,
+        "all_total": counts["all"],
+        "counts": counts,
+        "page": page,
+        "size": size,
+        "pages": pages,
         "count": len(gids),
         "groups": [
-            {"group_id": gid, "group_name": group_names.get(gid) or gid} for gid in gids
+            {"group_id": gid, "group_name": group_names.get(gid) or gid,
+             "is_source": gid in sources,
+             "fetched_at": _fmt_time(entries[gid]["fetched_at"]),
+             "stale": bool(entries[gid].get("stale"))} for gid in gids
         ],
     }

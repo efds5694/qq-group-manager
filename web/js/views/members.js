@@ -1,408 +1,136 @@
-// 成员页：筛选、排序、分页、多选、导出
+import { state, loadPrefs, savePrefs, groupDisplayName } from '../state.js';
+import { esc, fmtNumber } from '../ui.js';
+import { FilterBar, catalog, emptyRule, fieldSelectOptions } from '../filters.js';
+import { initialize, requestData, jobBanner, scopeContext, tableHtml, bindTable, showDetails, chooseColumns,
+  chooseGroups, exportData, collect, errorBox, defaultSources, names } from '../workspace.js';
+import { openRename } from '../actions.js';
+import { bindAutoPage } from '../pagination.js';
 
-import * as api from '../api.js';
-import { state, setMembers, replaceSelection, toggleSelection, clearSelection, groupDisplayName } from '../state.js';
-import { navigate } from '../router.js';
-import { toast, esc, fmtNumber, roleTag, emptyState, copyText } from '../ui.js';
-import { openExportDialog } from '../export.js';
+let reload = null;
 
-const query = { q: '', role: 'all', year: 'all', sort: 'join_time', desc: true, page: 1, size: 200 };
-
-function minutes(ts) {
-  return ts ? (Date.now() / 1000 - ts) / 86400 : Infinity;
-}
-
-function row(item, selected) {
-  const silent = minutes(item.last_sent_ts) > 30;
-  return `
-    <tr data-qq="${esc(item.qq)}" class="${selected ? 'selected' : ''}">
-      <td class="col-check">
-        <label class="checkbox">
-          <input type="checkbox" data-check="${esc(item.qq)}" ${selected ? 'checked' : ''} />
-          <span></span>
-        </label>
-      </td>
-      <td>
-        <div class="name-cell">
-          <span class="primary-name">${esc(item.display_name || '（无昵称）')}</span>
-          <span class="secondary-name">${esc(item.nickname)}</span>
-        </div>
-      </td>
-      <td class="mono num">${esc(item.qq)}</td>
-      <td class="card-cell faint">${esc(item.card || '—')}</td>
-      <td>${roleTag(item.role)}</td>
-      <td class="mono num">${esc(item.level || '—')}</td>
-      <td class="mono num">${esc(item.join_time || '—')}</td>
-      <td class="mono num ${silent ? 'silent' : ''}">${esc(item.last_sent_time || '从未')}</td>
-      <td class="col-actions">
-        <button class="icon-btn" data-edit="${esc(item.qq)}" title="单独修改此人的名片" type="button">
-          <svg viewBox="0 0 24 24"><path d="M4 20h4l10-10a2.8 2.8 0 0 0-4-4L4 16z"/></svg>
-        </button>
-      </td>
-    </tr>`;
-}
-
-function tableHtml(data) {
-  if (!data.items.length) {
-    return emptyState(
-      '没有匹配的成员',
-      '调整关键词或筛选条件；如果刚加入新成员，点右上角刷新。'
-    );
-  }
-  const rows = data.items.map((item) => row(item, state.selection.has(item.qq))).join('');
-  return `
-    <div class="table-wrap" style="max-height:calc(100vh - 320px)">
-      <table class="table">
-        <thead>
-          <tr>
-            <th class="col-check"><label class="checkbox"><input type="checkbox" id="check-all" /><span></span></label></th>
-            <th class="sortable" data-sort="nickname">成员</th>
-            <th>QQ 号</th>
-            <th>群名片</th>
-            <th class="sortable" data-sort="role">身份</th>
-            <th>等级</th>
-            <th class="sortable" data-sort="join_time">加群时间</th>
-            <th class="sortable" data-sort="last_sent_time">最后发言</th>
-            <th class="col-actions"></th>
-          </tr>
-        </thead>
-        <tbody>${rows}</tbody>
-      </table>
-    </div>`;
-}
-
-export async function render(root) {
-  if (!state.group) {
-    root.innerHTML = `
-      <div class="page">
-        <div class="card"><div class="card-body">
-          ${emptyState('还没有选择群', '先到「群组」页选一个群，再回来管理成员。')}
-          <div class="row" style="justify-content:center">
-            <button class="btn btn-primary" id="goto-groups" type="button">去选择群</button>
-          </div>
-        </div></div>
-      </div>`;
-    root.querySelector('#goto-groups')?.addEventListener('click', () => navigate('groups'));
-    return;
-  }
-
-  query.page = 1;
-  const group = state.group;
-  const canManage = ['owner', 'admin'].includes(group.my_role);
-  const groupTitle = groupDisplayName(group) || group.group_name;
-  const originName = groupTitle !== group.group_name ? `群名 ${esc(group.group_name)} · ` : '';
-
-  root.innerHTML = `
-    <div class="page">
-      <div class="page-head">
-        <div>
-          <h1>${esc(groupTitle)}</h1>
-          <p>${originName}群号 <span class="mono">${esc(group.group_id)}</span> · 已载入 <span id="all-total">${fmtNumber(group.member_count)}</span> 人
-            <span id="fetched-at" class="faint"></span></p>
-        </div>
-        <div class="page-actions">
-          <button class="btn" id="btn-export" type="button">导出</button>
-          <button class="btn btn-primary ${canManage ? '' : 'is-disabled'}" id="btn-batch-card" type="button" ${canManage ? '' : 'disabled'}>批量改名片</button>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="card-body tight" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-          <input class="input" id="m-search" placeholder="搜索昵称 / 群名片 / QQ 号" style="width:230px" />
-          <div class="seg" id="role-seg">
-            <button data-role="all" class="active" type="button">全部</button>
-            <button data-role="owner" type="button">群主</button>
-            <button data-role="admin" type="button">管理员</button>
-            <button data-role="member" type="button">成员</button>
-          </div>
-          <select class="select" id="year-select" style="width:130px"><option value="all">全部年份</option></select>
-          <select class="select" id="size-select" style="width:110px">
-            <option value="100">每页 100</option>
-            <option value="200" selected>每页 200</option>
-            <option value="500">每页 500</option>
-          </select>
-          <span class="spacer"></span>
-          <span class="tiny faint" id="table-summary"></span>
-        </div>
-        <div id="member-body"><div class="skeleton" style="height:240px;margin:14px"></div></div>
-        <div class="card-body tight" style="display:flex;align-items:center;justify-content:space-between;border-top:1px solid var(--line)">
-          <span class="tiny faint" id="page-info"></span>
-          <div class="pager" id="pager"></div>
-        </div>
-      </div>
-    </div>
-
-    <div class="action-bar" id="selection-bar">
-      <span>已选 <span class="count" id="selected-count">0</span> 人</span>
-      <span class="divider"></span>
-      <button class="btn btn-sm" data-bar="copy" type="button">复制 QQ 号</button>
-      <button class="btn btn-sm" data-bar="export" type="button">导出所选</button>
-      <button class="btn btn-sm btn-primary" data-bar="cards" type="button">批量改名片</button>
-      <button class="btn btn-sm btn-text" data-bar="clear" type="button">取消选择</button>
-    </div>`;
-
-  const body = root.querySelector('#member-body');
-  const pager = root.querySelector('#pager');
-  const pageInfo = root.querySelector('#page-info');
-  const summary = root.querySelector('#table-summary');
-  const yearSelect = root.querySelector('#year-select');
-  const sizeSelect = root.querySelector('#size-select');
-  const searchInput = root.querySelector('#m-search');
-  const bar = root.querySelector('#selection-bar');
-
-  const updateBar = () => {
-    const count = state.selection.size;
-    root.querySelector('#selected-count').textContent = count;
-    bar.classList.toggle('show', count > 0);
+export async function render(container) {
+  await initialize();
+  const key = `workbench.${state.session?.login?.user_id || 'local'}`;
+  const prefs = loadPrefs()[key] || {};
+  const available = new Set(state.groups.map(group => group.group_id));
+  const incoming = state.workbenchGroups ?? state.crossGroupTargets;
+  let groupIds = (incoming ?? prefs.groupIds ?? (state.group ? [state.group.group_id] : defaultSources())).filter(gid => available.has(gid));
+  state.workbenchGroups = state.crossGroupTargets = null;
+  let sources = (prefs.sources ?? defaultSources()).filter(gid => available.has(gid));
+  let mode = state.workbenchMode || prefs.mode || 'memberships';
+  state.workbenchMode = null;
+  let rule = prefs.rule || emptyRule();
+  let columns = prefs.columns || catalog.member_columns;
+  let matrixField = prefs.matrixField || 'member.card';
+  let sort = prefs.sort || { field: 'member.qq', desc: false };
+  let groupBy = prefs.groupBy || {};
+  let search = prefs.search || '';
+  let page = 1;
+  let selected = new Set();
+  let range = 'filtered';
+  let data = null;
+  let ticket = 0;
+  let loading = false;
+  let scrollLeft = 0;
+  container.innerHTML = `<div class="page members-workspace"><div class="page-head"><div><span class="eyebrow">MEMBER WORKSPACE</span><h1>成员工作台</h1><p>一套条件查看资料、比较群分布，并对结果执行操作。</p></div><div class="page-actions"><button class="btn" id="members-refresh">刷新名单</button><button class="btn btn-primary" id="members-rename">改群昵称</button></div></div>
+    <div class="scope-strip"><div><span class="eyebrow">查看范围</span><strong id="members-scope-label"></strong><span id="members-scope-names"></span></div><button class="btn btn-sm" id="members-scope">选择群聊</button><span class="scope-strip-divider"></span><details class="source-settings"><summary class="btn btn-sm">基准群与优先级 <span id="members-source-count"></span></summary><div class="source-settings-panel"><p class="tiny muted">参考资料按顺序采用第一个非空群昵称。基准可在查看范围外，不计入所在群数。</p><div id="members-sources"></div><div class="row"><button class="btn btn-sm" id="members-pick-sources">选择基准群</button><button class="btn btn-sm btn-text" id="members-default-sources">默认【师生】群</button><button class="btn btn-sm btn-text" id="members-include-sources">加入查看范围</button></div></div></details></div>
+    <section class="workspace-card"><div class="workspace-search"><div class="view-tabs"><button data-mode="memberships">成员明细</button><button data-mode="people">跨群分布</button></div><input class="input" id="members-search" placeholder="搜索昵称、群昵称、QQ号或群显示名" aria-label="搜索成员" value="${esc(search)}"/><span class="workspace-total" id="members-total">读取中</span></div><div id="members-filter" class="shared-filter"></div>
+      <div class="workspace-toolbar"><select class="input operation-range" id="members-range" aria-label="操作范围"><option value="filtered">当前全部筛选结果</option><option value="selected">仅勾选的记录</option></select><span id="members-selection" class="tiny muted"></span><button class="btn btn-sm btn-text" id="members-clear">取消勾选</button><span class="spacer"></span>
+        <label class="matrix-field-label" id="matrix-field-label">单元格字段<select class="input" id="matrix-field">${fieldSelectOptions(matrixField)}</select></label><button class="btn btn-sm" id="members-columns">字段</button>
+        <details class="display-options"><summary class="btn btn-sm">分组</summary><div><label>分组字段<select class="input" id="members-group-field"><option value="">不分组</option>${fieldSelectOptions(groupBy.field)}</select></label><label>提取分组的正则（可选）<input class="input mono" id="members-group-pattern" value="${esc(groupBy.pattern || '')}" placeholder="例如 ^(\\d{4})"/></label><button class="btn btn-sm" id="members-group-apply">应用分组</button></div></details>
+        <button class="btn btn-sm" id="members-copy">复制表格</button><select class="input format-select" id="members-format" aria-label="导出格式">${(state.config?.formats || ['csv']).map(format => `<option>${format}</option>`).join('')}</select><button class="btn btn-sm" id="members-export">导出</button></div>
+      <div id="members-progress" hidden></div><div class="table-wrap workspace-table" id="members-table"></div><div class="workspace-pagination"><span id="members-page" class="tiny muted"></span><span class="spacer"></span><button class="btn btn-sm" id="members-prev">上一页</button><button class="btn btn-sm" id="members-next">下一页</button></div></section>
+    <div class="workspace-secondary-actions"><button class="btn btn-text btn-sm" id="members-collect">补全范围内资料</button><button class="btn btn-text btn-sm" id="members-retry">重试采集失败项</button><span class="tiny faint" id="members-data-note"></span></div></div>`;
+  const root = container.querySelector('.members-workspace');
+  const table = root.querySelector('#members-table');
+  const progress = root.querySelector('#members-progress');
+  const spec = (useRange = false) => ({ entity: mode, scope: scopeContext(groupIds, sources), filter: rule, fields: columns, sort,
+    search, page, size: 50, matrix_field: matrixField, group_by: groupBy, selected: useRange && range === 'selected' ? [...selected] : undefined });
+  const save = () => savePrefs({ [key]: { groupIds, sources, mode, rule, columns, matrixField, sort, groupBy, search } });
+  const selection = () => {
+    root.querySelector('#members-selection').textContent = `已勾选 ${selected.size} ${mode === 'people' ? '人' : '条记录'}`;
+    root.querySelector('#members-clear').disabled = !selected.size;
+    const disabled = loading || !data?.total || (range === 'selected' && !selected.size);
+    for (const id of ['members-rename', 'members-copy', 'members-export']) root.querySelector(`#${id}`).disabled = disabled;
   };
-
-  const applySelection = (mutate) => {
-    mutate();
-    updateBar();
+  const clear = () => { selected.clear(); range = 'filtered'; root.querySelector('#members-range').value = range; };
+  const paintScope = () => {
+    root.querySelector('#members-scope-label').textContent = `${groupIds.length} 个群`;
+    root.querySelector('#members-scope-names').textContent = names(groupIds).join('、') || '请先选择群聊';
+    root.querySelector('#members-source-count').textContent = `(${sources.length})`;
+    root.querySelector('#members-sources').innerHTML = sources.map((gid, index) => `<div class="source-order-row"><span>${index+1}</span><strong title="${esc(names([gid])[0])}">${esc(names([gid])[0])}</strong><button class="icon-btn" data-source-move="${esc(gid)}" data-step="-1" ${index ? '' : 'disabled'} title="提高优先级">↑</button><button class="icon-btn" data-source-move="${esc(gid)}" data-step="1" ${index < sources.length-1 ? '' : 'disabled'} title="降低优先级">↓</button></div>`).join('') || '<p class="tiny faint">尚未选择基准群。</p>';
+    root.querySelectorAll('[data-source-move]').forEach(button => button.addEventListener('click', () => {
+      const index = sources.indexOf(button.dataset.sourceMove), other = index + Number(button.dataset.step);
+      [sources[index], sources[other]] = [sources[other], sources[index]]; clear(); paintScope(); load();
+    }));
   };
-
-  const bindTable = (data) => {
-    const all = root.querySelector('#check-all');
-    const pageQqs = data.items.map((item) => item.qq);
-    const selectedOnPage = pageQqs.filter((qq) => state.selection.has(qq)).length;
-    if (all) {
-      all.checked = selectedOnPage > 0 && selectedOnPage === pageQqs.length;
-      all.indeterminate = selectedOnPage > 0 && selectedOnPage < pageQqs.length;
-      all.addEventListener('change', () => {
-        applySelection(() => {
-          pageQqs.forEach((qq) => {
-            if (all.checked) state.selection.add(qq);
-            else state.selection.delete(qq);
-          });
-        });
-        body.innerHTML = tableHtml(data);
-        bindTable(data);
-      });
+  const load = async (force = false) => {
+    const token = ++ticket; loading = true; data = null;
+    if (table.querySelector('table')) scrollLeft = table.scrollLeft;
+    table.scrollTop = 0;
+    table.innerHTML = '<div class="skeleton table-loading"></div>';
+    root.querySelectorAll('[data-mode]').forEach(button => button.classList.toggle('active', button.dataset.mode === mode));
+    root.querySelector('#matrix-field-label').hidden = mode !== 'people';
+    root.querySelector('#members-prev').disabled = root.querySelector('#members-next').disabled = true;
+    selection(); save();
+    if (!groupIds.length) {
+      table.innerHTML = '<div class="empty"><strong>选择要查看的群聊</strong><p>可以选择单个群，也可以组合多个群。</p></div>';
+      root.querySelector('#members-total').textContent = '尚未选择群'; loading = false; selection(); return;
     }
-
-    body.querySelectorAll('[data-check]').forEach((node) => {
-      node.addEventListener('change', () => {
-        applySelection(() => toggleSelection(node.dataset.check));
-        node.closest('tr')?.classList.toggle('selected', node.checked);
-        const current = root.querySelector('#check-all');
-        const rest = root.querySelectorAll('[data-check]');
-        const checked = root.querySelectorAll('[data-check]:checked');
-        if (current) {
-          current.checked = rest.length > 0 && checked.length === rest.length;
-          current.indeterminate = checked.length > 0 && checked.length < rest.length;
-        }
-      });
-    });
-
-    body.querySelectorAll('[data-edit]').forEach((node) => {
-      node.addEventListener('click', () => {
-        replaceSelection([node.dataset.edit]);
-        navigate('cards');
-      });
-    });
-
-    root.querySelectorAll('.table th[data-sort]').forEach((th) => {
-      const key = th.dataset.sort;
-      th.classList.add('sortable');
-      th.addEventListener('click', () => {
-        if (query.sort === key) query.desc = !query.desc;
-        else {
-          query.sort = key;
-          query.desc = true;
-        }
-        query.page = 1;
-        load();
-      });
-    });
-  };
-
-  const renderPager = (data) => {
-    pager.innerHTML = '';
-    const totalPages = data.pages;
-    const makeBtn = (label, page, disabled = false, active = false) => {
-      const button = document.createElement('button');
-      button.className = `btn btn-sm ${active ? 'btn-primary' : ''}`;
-      button.textContent = label;
-      button.disabled = disabled;
-      button.addEventListener('click', () => {
-        query.page = page;
-        load();
-      });
-      return button;
-    };
-    pager.appendChild(makeBtn('‹', query.page - 1, query.page <= 1));
-    const windowStart = Math.max(1, query.page - 2);
-    const windowEnd = Math.min(totalPages, windowStart + 4);
-    for (let page = windowStart; page <= windowEnd; page += 1) {
-      pager.appendChild(makeBtn(String(page), page, false, page === query.page));
-    }
-    pager.appendChild(makeBtn('›', query.page + 1, query.page >= totalPages));
-  };
-
-  let lastData = null;
-  let staleRetried = false;
-
-  const paint = (data) => {
-    lastData = data;
-    body.innerHTML = tableHtml(data);
-    bindTable(data);
-    renderPager(data);
-    pageInfo.textContent = `第 ${data.page} / ${data.pages} 页 · 筛选出 ${fmtNumber(data.total)} 人`;
-    summary.textContent = `群主 ${data.counts.owner} · 管理员 ${data.counts.admin} · 成员 ${data.counts.member} · 空名片 ${data.counts.empty_card}`;
-    root.querySelector('#all-total').textContent = fmtNumber(data.all_total);
-    root.querySelector('#fetched-at').textContent = data.fetched_at
-      ? `（数据时间 ${data.fetched_at}${data.stale ? ' · 正在后台更新' : ''}）`
-      : '';
-    if (data.self?.role) {
-      const manage = ['owner', 'admin'].includes(data.self.role);
-      const button = root.querySelector('#btn-batch-card');
-      if (button) {
-        button.disabled = !manage;
-        button.classList.toggle('btn-primary', manage);
-      }
-    }
-    const years = data.years || [];
-    const current = yearSelect.value;
-    yearSelect.innerHTML =
-      '<option value="all">全部年份</option>' +
-      years.map((year) => `<option value="${esc(year)}">${esc(year)} 年</option>`).join('');
-    yearSelect.value = years.includes(current) ? current : 'all';
-    query.year = yearSelect.value;
-    updateBar();
-  };
-
-  async function load({ silent = false, fresh = false } = {}) {
-    if (!silent) body.innerHTML = '<div class="skeleton" style="height:240px;margin:14px"></div>';
     try {
-      const data = await api.get(`/api/groups/${encodeURIComponent(group.group_id)}/members`, {
-        q: query.q,
-        role: query.role,
-        year: query.year,
-        sort: query.sort,
-        desc: query.desc ? 1 : 0,
-        page: query.page,
-        size: query.size,
-        refresh: fresh ? 1 : '',
-      });
-      setMembers(data);
-      paint(data);
-      // 后端先给了旧缓存，后台正在刷新：稍等一会儿自动补一次最新数据
-      if (data.stale && !staleRetried) {
-        staleRetried = true;
-        window.setTimeout(() => load({ silent: true }), 2500);
-      }
-      return data;
+      const response = await requestData('/api/query', { ...spec(), refresh: force }, job => jobBanner(progress, job));
+      if (!root.isConnected || token !== ticket) return;
+      data = response; page = data.page;
+      table.innerHTML = tableHtml(data, selected, { matrix: mode === 'people', matrixField }); table.scrollLeft = scrollLeft;
+      bindTable(table, data, selected, () => { if (selected.size) { range = 'selected'; root.querySelector('#members-range').value = range; } selection(); },
+        field => { sort = { field, desc: sort.field === field ? !sort.desc : false }; load(); }, (row, gid) => showDetails(spec(), row, gid));
+      root.querySelector('#members-total').textContent = `${fmtNumber(data.people)} 人 · ${fmtNumber(data.memberships)} 条记录`;
+      root.querySelector('#members-page').textContent = `第 ${page} / ${data.pages} 页 · ${fmtNumber(data.total)} ${mode === 'people' ? '人' : '条群成员记录'}${data.pages > 1 ? page < data.pages ? ' · 触底自动下一页' : ' · 已到最后一页' : ''}`;
+      root.querySelector('#members-prev').disabled = page <= 1; root.querySelector('#members-next').disabled = page >= data.pages;
+      root.querySelector('#members-data-note').textContent = mode === 'people'
+        ? '矩阵保留真实群关系；“匹配”标记对应命中的记录，未标记的已有记录不会当成未加入。'
+        : data.groups.some(group => group.stale) ? '部分群使用旧缓存，可刷新名单；筛选需要额外资料时自动补全。' : '资料按需加载；未采集、采集失败与未提供分别显示。';
+      return true;
     } catch (error) {
-      if (!lastData) {
-        body.innerHTML = `
-          <div style="padding:16px">
-            <div class="hint-box danger">
-              <span class="hint-icon">!</span>
-              <div><strong>${esc(error.message)}</strong>${error.hint ? `<br><span class="faint">${esc(error.hint)}</span>` : ''}</div>
-            </div>
-          </div>`;
-      } else {
-        toast(error.message, 'err', error.hint);
-      }
-      return null;
-    }
-  }
-
-  // ---------------------------------------------------------- 交互绑定
-  let searchTimer = 0;
-  searchInput.addEventListener('input', () => {
-    window.clearTimeout(searchTimer);
-    searchTimer = window.setTimeout(() => {
-      query.q = searchInput.value.trim();
-      query.page = 1;
-      load();
-    }, 280);
-  });
-
-  root.querySelectorAll('#role-seg button').forEach((button) => {
-    button.addEventListener('click', () => {
-      root.querySelectorAll('#role-seg button').forEach((item) => item.classList.remove('active'));
-      button.classList.add('active');
-      query.role = button.dataset.role;
-      query.page = 1;
-      load();
-    });
-  });
-
-  yearSelect.addEventListener('change', () => {
-    query.year = yearSelect.value;
-    query.page = 1;
-    load();
-  });
-
-  sizeSelect.addEventListener('change', () => {
-    query.size = Number(sizeSelect.value);
-    query.page = 1;
-    load();
-  });
-
-  root.querySelector('#btn-batch-card').addEventListener('click', () => navigate('cards'));
-
-  const doExport = (scope) => {
-    const total = scope === 'selected' ? state.selection.size : lastData?.total ?? 0;
-    openExportDialog({
-      title: '导出群成员',
-      scopeText: scope === 'selected' ? `已勾选的 ${total} 人` : `当前筛选结果 ${fmtNumber(total)} 人`,
-      basePath: `/api/groups/${encodeURIComponent(group.group_id)}/export`,
-      extraQuery: {
-        scope,
-        q: query.q,
-        role: query.role,
-        year: query.year,
-        sort: query.sort,
-        desc: query.desc ? 1 : 0,
-        selected: scope === 'selected' ? [...state.selection].join(',') : '',
-      },
-    });
+      if (root.isConnected && token === ticket) { table.innerHTML = errorBox(error); root.querySelector('#members-total').textContent = '查询未完成'; }
+      return false;
+    } finally { if (token === ticket) { loading = false; selection(); } }
   };
-
-  root.querySelector('#btn-export').addEventListener('click', () => doExport('filtered'));
-  bar.querySelector('[data-bar="export"]').addEventListener('click', () => doExport('selected'));
-  bar.querySelector('[data-bar="copy"]').addEventListener('click', async () => {
-    const list = [...state.selection];
-    if (!list.length) return;
-    try {
-      await copyText(list.join('\n'));
-      toast(`已复制 ${list.length} 个 QQ 号`, 'ok', '每行一个，可直接粘到搜索框或表格');
-    } catch (error) {
-      toast(error.message, 'err', error.hint);
-    }
+  const changePage = async next => {
+    if (loading || !data || next < 1 || next > data.pages) return;
+    const previous = page;
+    page = next;
+    if (await load() === false) page = previous;
+  };
+  bindAutoPage(table, () => !loading && data && page < data.pages, () => changePage(page + 1));
+  reload = load;
+  new FilterBar(root.querySelector('#members-filter'), { rule, onApply(value) { rule = value; page = 1; clear(); load(); } });
+  root.querySelector('#members-scope').addEventListener('click', () => chooseGroups({ selected: groupIds, onApply(ids) { groupIds = ids; page = 1; clear(); scrollLeft = 0; paintScope(); load(); } }));
+  root.querySelector('#members-pick-sources').addEventListener('click', () => chooseGroups({ title: '选择基准群', selected: sources, onApply(ids) { sources = ids; clear(); paintScope(); load(); } }));
+  root.querySelector('#members-default-sources').addEventListener('click', () => { sources = defaultSources(); clear(); paintScope(); load(); });
+  root.querySelector('#members-include-sources').addEventListener('click', () => { groupIds = [...new Set([...sources, ...groupIds])]; clear(); paintScope(); load(); });
+  root.querySelector('#members-search').addEventListener('change', event => { search = event.target.value.trim(); page = 1; clear(); load(); });
+  root.querySelectorAll('[data-mode]').forEach(button => button.addEventListener('click', () => { mode = button.dataset.mode; page = 1; clear(); scrollLeft = 0; load(); }));
+  root.querySelector('#members-clear').addEventListener('click', () => { clear(); load(); });
+  root.querySelector('#members-range').addEventListener('change', event => { range = event.target.value; selection(); });
+  root.querySelector('#matrix-field').value = matrixField;
+  root.querySelector('#matrix-field').addEventListener('change', event => { matrixField = event.target.value; clear(); load(); });
+  root.querySelector('#members-columns').addEventListener('click', () => chooseColumns(columns, value => { columns = value; load(); }));
+  root.querySelector('#members-group-field').value = groupBy.field || '';
+  root.querySelector('#members-group-apply').addEventListener('click', () => {
+    groupBy = { field: root.querySelector('#members-group-field').value, pattern: root.querySelector('#members-group-pattern').value };
+    root.querySelector('.display-options').open = false; clear(); page = 1; load();
   });
-  bar.querySelector('[data-bar="cards"]').addEventListener('click', () => navigate('cards'));
-  bar.querySelector('[data-bar="clear"]').addEventListener('click', () => {
-    applySelection(() => clearSelection());
-    load();
-  });
-
-  // 上一次拿到的名单还能用就先画出来，避免每次进页面都对着骨架屏
-  const cachedPayload = state.members && state.members.group_id === group.group_id ? state.members : null;
-  if (cachedPayload) {
-    paint(cachedPayload);
-    await load({ silent: true });
-  } else {
-    await load();
-  }
+  root.querySelector('#members-refresh').addEventListener('click', () => { clear(); load(true); });
+  root.querySelector('#members-prev').addEventListener('click', () => changePage(page - 1));
+  root.querySelector('#members-next').addEventListener('click', () => changePage(page + 1));
+  root.querySelector('#members-copy').addEventListener('click', () => exportData(spec(true), 'tsv', progress));
+  root.querySelector('#members-export').addEventListener('click', () => exportData(spec(true), root.querySelector('#members-format').value, progress));
+  root.querySelector('#members-rename').addEventListener('click', () => openRename(spec(true), progress, () => { clear(); load(true); }));
+  root.querySelector('#members-collect').addEventListener('click', () => collect(groupIds, progress, false, () => load()));
+  root.querySelector('#members-retry').addEventListener('click', () => collect(groupIds, progress, true, () => load()));
+  paintScope(); await load();
+  if (state.pendingRename) { state.pendingRename = false; if (data?.total) openRename(spec(true), progress, () => { clear(); load(true); }); }
 }
 
-export async function refresh() {
-  const root = document.getElementById('view');
-  if (!state.group) return;
-  query.page = 1;
-  const data = await api.get(`/api/groups/${encodeURIComponent(state.group.group_id)}/members`, {
-    q: query.q,
-    role: query.role,
-    year: query.year,
-    sort: query.sort,
-    desc: query.desc ? 1 : 0,
-    page: 1,
-    size: query.size,
-    refresh: 1,
-  });
-  setMembers(data);
-  await render(root);
-}
+export async function refresh() { await reload?.(true); }

@@ -12,6 +12,9 @@ export const state = {
   plan: null,
   connected: false,
   caps: {},
+  crossGroupTargets: null,
+  workbenchGroups: null,
+  workbenchMode: null,
 };
 
 const listeners = new Set();
