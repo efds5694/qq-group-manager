@@ -49,6 +49,7 @@ def normalize_group(group, detail, favorite=False, show_remark=True):
         result.pop("my_role", None)
         result.pop("manageable", None)
     result.update(raw=raw, favorite=favorite)
+    result["fetched_at"] = group.get("fetched_at")
     result["display_name"] = (result.get("group_remark") if show_remark else "") or result.get("group_name") or result["group_id"]
     return result
 
@@ -133,21 +134,37 @@ def prepare(client, self_id, spec):
             by_group[gid].append(record)
     sources = source_ids
     targets = [gid for gid in ids if gid not in sources]
+    id_set = set(ids)
+    visible_by_qq = {qq: [item for item in memberships if item["group"]["group_id"] in id_set]
+                     for qq, memberships in by_qq.items()}
+    source_field = spec.get("source_field", "member.card")
     people = {}
     for qq, memberships in by_qq.items():
         by_gid = {item["group"]["group_id"]: item for item in memberships}
         references = [(gid, by_gid[gid]["member"].get("card")) for gid in sources if gid in by_gid and by_gid[gid]["member"].get("card")]
         source, card = references[0] if references else ("", "")
-        visible = [item for item in memberships if item["group"]["group_id"] in ids]
-        people[qq] = {"group_count": len(visible), "reference_card": card, "source_group_id": source,
-                      "source_conflict": len({text for _, text in references}) > 1,
-                      "nickname_difference": bool(card) and any(gid in by_gid and by_gid[gid]["member"].get("card") != clamp(card, CARD_MAX_LEN)[0] for gid in targets),
+        visible = visible_by_qq[qq]
+        resolved = []
+        for gid in sources:
+            if gid not in by_gid:
+                continue
+            val = fields.value(by_gid[gid], source_field)
+            if val is not fields.MISSING and fields.display(val, fields.BY_ID.get(source_field)).strip():
+                resolved.append({"group_id": gid, "name": group_map[gid]["display_name"],
+                                 "text": fields.display(val, fields.BY_ID.get(source_field))})
+        people[qq] = {"group_count": len(visible), "reference_card": card, "source_group_id": resolved[0]["group_id"] if resolved else "",
+                      "group_names": [item["group"]["display_name"] for item in visible],
+                      "reference_text": resolved[0]["text"] if resolved else "",
+                      "source_group_name": resolved[0]["name"] if resolved else "",
+                      "source_values": resolved,
+                      "source_conflict": len({item["text"] for item in resolved}) > 1,
+                      "nickname_difference": bool(resolved) and any(gid in by_gid and by_gid[gid]["member"].get("card") != clamp(resolved[0]["text"], CARD_MAX_LEN)[0] for gid in targets),
                       "in_all": len(visible) == len(ids)}
     all_records = list(records)
     records = [record for record in records if record["group"]["group_id"] in ids]
     for record in records:
         qq, gid = record["member"]["qq"], record["group"]["group_id"]
-        record.update(person=people[qq], memberships=[item for item in by_qq[qq] if item["group"]["group_id"] in ids], members=by_group[gid])
+        record.update(person=people[qq], memberships=visible_by_qq[qq], members=by_group[gid])
     group_rows = [{"id": gid, "group": group_map[gid], "members": by_group[gid]} for gid in ids]
     definitions = fields.discover(group_rows + records)
     return {"entity": entity, "groups": {gid: group_map[gid] for gid in ids}, "all_groups": group_map,
@@ -273,10 +290,12 @@ def execute(dataset, spec, *, paginate=True):
                 **project(record, columns)}
         if "bucket" in record:
             item["bucket"] = record["bucket"]
+        if (spec.get("scope") or {}).get("source_group_ids"):
+            item["source_values"] = record.get("person", {}).get("source_values", [])
         if dataset["entity"] == "people":
             item["matched_ids"] = record["matched_ids"]
             item["person"] = record["person"]
-            matrix_keys = list(dict.fromkeys([spec.get("matrix_field", "member.card"), "member.role", "member.card"]))
+            matrix_keys = list(dict.fromkeys([spec.get("matrix_field", "member.card"), "member.role", "member.card", "member.nickname"]))
             item["memberships"] = [{"group_id": child["group"]["group_id"], **project(child, matrix_keys),
                                      "matched": f'{child["group"]["group_id"]}:{record["member"]["qq"]}' in record["matched_ids"]}
                                     for child in record["memberships"]]
@@ -284,7 +303,12 @@ def execute(dataset, spec, *, paginate=True):
             item["raw"] = {"group": record["group"].get("raw", {}), "member": record.get("member", {}).get("raw", {}),
                            "collection": dataset["details"].get(item["group_id"], {})}
         items.append(item)
+    data_times = [entry["fetched_at"] for entry in dataset["entries"].values() if entry.get("fetched_at")]
+    if not data_times:
+        data_times = [group["fetched_at"] for group in dataset["groups"].values() if group.get("fetched_at")]
     return {"items": items, "total": total, "page": page, "size": size, "pages": pages, "fields": dataset["fields"], "buckets": buckets,
+            "data_at": min(data_times) if data_times else None,
+            "stale": any(entry.get("stale") for entry in dataset["entries"].values()),
             "columns": columns, "people": len({row.get("member", {}).get("qq") for row in matched}) if dataset["entity"] != "groups" else 0,
             "memberships": len(matched) if dataset["entity"] != "groups" else 0,
             "groups": [{"group_id": gid, "name": group["display_name"],

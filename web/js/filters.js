@@ -80,13 +80,14 @@ function renderRule(rule, path = '') {
 }
 
 export class FilterBar {
-  constructor(element, { rule, onApply, compact = false, entity = 'memberships' } = {}) {
+  constructor(element, { rule, onApply, compact = false, entity = 'memberships', context = 'all' } = {}) {
     this.element = element;
     this.rule = clone(rule || emptyRule());
     this.draft = clone(this.rule);
     this.onApply = onApply;
     this.compact = compact;
     this.entity = entity;
+    this.context = context;
     this.selectedPreset = '';
     this.temporary = false;
     this.paint();
@@ -100,7 +101,11 @@ export class FilterBar {
     return `<option value="" ${!this.selectedPreset || this.temporary ? 'selected' : ''}>临时筛选／选择预设</option>` + ['builtin', 'custom'].map(kind => `<optgroup label="${kind === 'builtin' ? '内置筛选' : '自定义筛选'}">${this.presets().filter(item => Boolean(item.builtin) === (kind === 'builtin')).map(item => `<option value="${esc(item.id)}" ${!this.temporary && this.selectedPreset === item.id ? 'selected' : ''}>${esc(item.name)}</option>`).join('')}</optgroup>`).join('');
   }
 
-  presets() { return this.entity === 'groups' ? catalog.group_presets : catalog.presets; }
+  presets() {
+    const presets = this.entity === 'groups' ? catalog.group_presets : catalog.presets;
+    return ['overview', 'comparison'].includes(this.context)
+      ? presets.filter(item => !['builtin-different','builtin-conflict','builtin-no-reference'].includes(item.id)) : presets;
+  }
 
   markTemporary() {
     this.temporary = true;

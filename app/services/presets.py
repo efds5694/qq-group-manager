@@ -38,8 +38,8 @@ def listing(config, entity="memberships"):
         ("multiple", "在多个群", condition("person.group_count", "gt", 1)),
         ("intersection", "同时在范围内全部群", condition("person.in_all", value=True)),
         ("different", "目标群昵称不一致", condition("person.nickname_difference", value=True)),
-        ("conflict", "基准群昵称有差异", condition("person.source_conflict", value=True)),
-        ("no-reference", "没有基准群昵称", condition("person.reference_card", "empty")),
+        ("conflict", "昵称来源有差异", condition("person.source_conflict", value=True)),
+        ("no-reference", "没有来源群昵称", condition("person.reference_card", "empty")),
         ("in-group", "在指定群…", relation(condition("group.group_id", value="请填写群号"))),
         ("not-in-group", "不在指定群…", relation(condition("group.group_id", value="请填写群号"), "none")),
         ("missing-course", "在师生群但不在课程群", {"op": "and", "rules": [

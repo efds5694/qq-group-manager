@@ -3,7 +3,8 @@ import * as api from './api.js';
 import { state, setGroups, loadPrefs, groupDisplayName } from './state.js';
 import { esc, openDrawer, closeDrawer, toast, copyText, fmtNumber } from './ui.js';
 import { FilterBar, catalog, loadCatalog, mergeFields, clone, emptyRule } from './filters.js';
-import { bindAutoPage } from './pagination.js';
+import { ResultTable, dataColumns } from './result-table.js';
+import { detailSections, renderField, groupTag, fieldStatusTag } from './field-display.js';
 
 export async function initialize() {
   await loadCatalog();
@@ -55,61 +56,42 @@ export function scopeContext(groupIds, sourceIds = []) {
     show_remark: loadPrefs().showRemark !== false };
 }
 
-export async function allRows(spec) {
-  const first = await requestData('/api/query', { ...spec, page: 1, size: 500 });
-  const items = [...first.items];
-  for (let page = 2; page <= first.pages; page++) {
-    const data = await requestData('/api/query', { ...spec, page, size: 500 });
-    items.push(...data.items);
-  }
-  return items;
-}
-
 export function chooseGroups({ title = '选择群聊范围', selected = [], excluded = [], onApply }) {
-  const chosen = new Set(selected);
-  let rule = emptyRule();
-  let page = 1;
-  let search = '';
-  let seq = 0;
-  let data = null;
-  let loading = false;
+  const chosen = new Set(selected.filter(gid => !excluded.includes(gid)));
+  let rule = emptyRule(), search = '', seq = 0, list;
   openDrawer({ title, wide: true,
-    body: '<div class="picker-intro"><p>使用同一套筛选条件查找群；勾选可跨页累积，列表触底自动下一页。</p><input class="input" id="scope-search" placeholder="搜索群名称、备注或群号" aria-label="搜索群范围"/></div><div id="scope-filter"></div><div id="scope-progress" hidden></div><div id="scope-results" class="scope-results"></div>',
-    footer: `<span class="tiny muted" id="scope-count"></span><button class="btn" id="scope-clear" type="button">清空勾选</button><button class="btn" data-close="1" type="button">取消</button><button class="btn btn-primary" id="scope-apply" type="button">应用群范围</button>`,
+    body: '<div class="picker-intro"><p>勾选需要的群，可以直接拖动滚动条查找；已勾选的群会保留。</p><input class="input" id="scope-search" placeholder="搜索群名称、备注或群号" aria-label="搜索群范围"/></div><div id="scope-filter"></div><div id="scope-progress" hidden></div><div id="scope-results" class="scope-results"></div>',
+    footer: '<span class="tiny muted" id="scope-count"></span><button class="btn" id="scope-clear">清空勾选</button><button class="btn" data-close="1">取消</button><button class="btn btn-primary" id="scope-apply">应用群范围</button>',
     onMount(panel, foot) {
       const count = () => { foot.querySelector('#scope-count').textContent = `已选 ${chosen.size} 个群`; };
-      const results = panel.querySelector('#scope-results');
       const load = async () => {
         const ticket = ++seq;
-        loading = true; data = null; results.scrollTop = 0;
-        results.innerHTML = '<div class="skeleton" style="height:160px"></div>';
+        const filter = excluded.length ? { op: 'and', rules: [rule, { op: 'not', rules: [{ field: 'group.group_id', op: 'in', value: excluded }] }] } : rule;
         try {
-          const response = await requestData('/api/query', { entity: 'groups', filter: rule, search, page, scope: scopeContext([]) }, job => jobBanner(panel.querySelector('#scope-progress'), job));
+          const data = await requestData('/api/query/start', { entity: 'groups', filter, search, scope: scopeContext([]),
+            fields: ['group.display_name','group.group_id','group.member_count','group.my_role'] }, job => jobBanner(panel.querySelector('#scope-progress'), job));
           if (ticket !== seq || !panel.isConnected) return;
-          data = response; page = data.page;
-          results.innerHTML = `<div class="scope-list">${data.items.filter(row => !excluded.includes(row.id)).map(row => `<label class="scope-pick-row"><span class="checkbox"><input type="checkbox" value="${esc(row.id)}" ${chosen.has(row.id) ? 'checked' : ''}/><span></span></span><span class="scope-pick-name"><strong>${esc(row.display['group.display_name'])}</strong><span>${esc(row.display['group.group_id'])} · ${esc(row.display['group.member_count'])} 人 · ${esc(row.display['group.my_role'])}</span></span></label>`).join('') || '<div class="empty"><strong>没有匹配的群</strong><p>调整筛选条件后再试。</p></div>'}</div><div class="picker-pager"><button class="btn btn-sm" data-page="-1" ${page <= 1 ? 'disabled' : ''}>上一页</button><span class="tiny muted">${page} / ${data.pages} 页 · ${fmtNumber(data.total)} 个群</span><button class="btn btn-sm" data-page="1" ${page >= data.pages ? 'disabled' : ''}>下一页</button></div>`;
-          results.querySelectorAll('input[type=checkbox]').forEach(check => check.addEventListener('change', () => {
-            if (check.checked) chosen.add(check.value); else chosen.delete(check.value); count();
-          }));
-          results.querySelectorAll('[data-page]').forEach(button => button.addEventListener('click', () => changePage(page + Number(button.dataset.page))));
-          return true;
-        } catch (error) { if (panel.isConnected && ticket === seq) results.innerHTML = errorBox(error); return false; }
-        finally { if (ticket === seq) loading = false; }
+          list?.destroy();
+          list = new ResultTable(panel.querySelector('#scope-results'), { selected: chosen, layoutKey:'group-picker', onSelection: count, onReload: load });
+          list.setData(data, dataColumns(data, { selected: chosen, detail: false }));
+        } catch (error) { if (panel.isConnected && ticket === seq) toast(error.message, 'err', error.hint); }
       };
-      const changePage = async next => {
-        if (loading || !data || next < 1 || next > data.pages) return;
-        const previous = page;
-        page = next;
-        if (await load() === false) page = previous;
-      };
-      bindAutoPage(results, () => !loading && data && page < data.pages, () => changePage(page + 1));
-      new FilterBar(panel.querySelector('#scope-filter'), { compact: true, entity: 'groups', onApply(value) { rule = value; page = 1; load(); } });
-      panel.querySelector('#scope-search').addEventListener('change', event => { search = event.target.value.trim(); page = 1; load(); });
-      foot.querySelector('#scope-clear').addEventListener('click', () => { chosen.clear(); count(); load(); });
-      foot.querySelector('#scope-apply').addEventListener('click', () => { closeDrawer(); onApply([...chosen]); });
+      new FilterBar(panel.querySelector('#scope-filter'), { compact: true, entity: 'groups', onApply(value) { rule = value; load(); } });
+      panel.querySelector('#scope-search').addEventListener('change', event => { search = event.target.value.trim(); load(); });
+      foot.querySelector('#scope-clear').addEventListener('click', () => { chosen.clear(); count(); list?.schedule(); });
+      foot.querySelector('#scope-apply').addEventListener('click', () => { list?.destroy(); closeDrawer(); onApply([...chosen]); });
       count(); load();
     },
   });
+}
+
+export async function allResultRows(data) {
+  const rows = [...data.items];
+  for (let offset = data.items.length; offset < data.total_rows; offset += 200) {
+    const next = await api.get(`/api/query/results/${data.query_id}`, { offset, limit: 200 });
+    rows.push(...next.items);
+  }
+  return rows.filter(row => row.kind !== 'group');
 }
 
 export function errorBox(error) {
@@ -124,7 +106,9 @@ export function chooseColumns(columns, onApply, entity = 'memberships') {
     footer: '<button class="btn" data-close="1">取消</button><button class="btn btn-primary" id="columns-apply">应用字段</button>',
     onMount(panel, foot) {
       const paint = (text = '') => {
-        panel.querySelector('#column-list').innerHTML = catalog.fields.filter(field => (entity !== 'groups' || field.id.startsWith('group.')) && `${field.label} ${field.id}`.toLowerCase().includes(text.toLowerCase())).map(field => `<label class="column-option"><input type="checkbox" value="${esc(field.id)}" ${selected.has(field.id) || mandatory.includes(field.id) ? 'checked' : ''} ${mandatory.includes(field.id) ? 'disabled' : ''}/><span><strong>${esc(field.label)}</strong><span class="tiny faint">${esc(field.source)} · ${esc(field.type)}</span></span></label>`).join('');
+        const allowed = field => entity === 'groups' ? field.id.startsWith('group.') : entity === 'people'
+          ? ['member.qq','member.nickname','person.group_count','person.group_names','person.in_all'].includes(field.id) : !field.id.startsWith('comparison.');
+        panel.querySelector('#column-list').innerHTML = catalog.fields.filter(field => allowed(field) && `${field.label} ${field.id}`.toLowerCase().includes(text.toLowerCase())).map(field => `<label class="column-option"><input type="checkbox" value="${esc(field.id)}" ${selected.has(field.id) || mandatory.includes(field.id) ? 'checked' : ''} ${mandatory.includes(field.id) ? 'disabled' : ''}/><span><strong>${esc(field.label)}</strong><span class="tiny faint">${esc(field.source)} · ${esc(field.type)}</span></span></label>`).join('');
       };
       panel.querySelector('#column-list').addEventListener('change', event => { if (event.target.checked) selected.add(event.target.value); else selected.delete(event.target.value); });
       panel.querySelector('#column-search').addEventListener('input', event => paint(event.target.value));
@@ -134,47 +118,10 @@ export function chooseColumns(columns, onApply, entity = 'memberships') {
   });
 }
 
-export function tableHtml(data, selected = new Set(), { matrix = false, matrixField = 'member.card' } = {}) {
-  const definitions = new Map(catalog.fields.map(field => [field.id, field]));
-  const identity = matrix ? ['member.qq', 'member.nickname'] : data.columns;
-  return `<table class="table data-table ${data.columns[0]?.startsWith('group.') ? 'group-data-table' : 'member-data-table'} ${matrix ? 'matrix-table' : ''}"><thead><tr><th class="identity-check"><span class="checkbox"><input type="checkbox" data-check-page aria-label="勾选当前页所有记录"/><span></span></span></th>
-    ${identity.map((key, index) => `<th class="${index === 0 ? 'identity-main' : index === 1 ? 'identity-secondary' : ''}" data-sort="${esc(key)}">${esc(definitions.get(key)?.label || key)}</th>`).join('')}
-    ${matrix ? `<th>基准群昵称</th>${data.groups.map(group => `<th class="matrix-group-head" title="${esc(group.group_id)}"><span>${esc(group.name)}</span><small>${esc(group.group_id)}</small></th>`).join('')}` : ''}<th class="row-action-head"></th></tr></thead><tbody>
-    ${data.items.map((row, index) => {
-      const memberships = new Map((row.memberships || []).map(member => [member.group_id, member]));
-      const bucket = row.bucket !== undefined && (index === 0 || row.bucket !== data.items[index-1].bucket)
-        ? `<tr class="bucket-row"><td colspan="${identity.length + (matrix ? data.groups.length + 1 : 0) + 2}">${esc(row.bucket)} <span>${data.buckets?.[row.bucket] || ''} 条</span></td></tr>` : '';
-      return `${bucket}<tr data-row="${esc(row.id)}" class="${selected.has(row.id) ? 'selected' : ''}"><td class="identity-check"><span class="checkbox"><input type="checkbox" data-check-row value="${esc(row.id)}" ${selected.has(row.id) ? 'checked' : ''} aria-label="勾选 ${esc(row.id)}"/><span></span></span></td>
-        ${identity.map((key, index) => `<td class="${index === 0 ? 'identity-main' : index === 1 ? 'identity-secondary' : ''} ${key.endsWith('.qq') || key.endsWith('.group_id') ? 'mono' : ''}" title="${esc(row.display[key])}">${['member.role', 'group.my_role'].includes(key) ? `<span class="tag tag-${esc(row.values[key] || 'ghost')}">${esc(row.display[key])}</span>` : esc(row.display[key] || '—')}</td>`).join('')}
-        ${matrix ? `<td class="reference-cell" title="${esc(row.person.reference_card)}">${esc(row.person.reference_card || '无基准昵称')}${row.person.source_conflict ? '<small class="text-warn">来源有差异</small>' : ''}</td>${data.groups.map(group => {
-          const membership = memberships.get(group.group_id);
-          return membership ? `<td class="matrix-present ${membership.matched ? 'matrix-matched' : ''}"><button class="cell-detail" data-detail="${esc(row.id)}" data-gid="${esc(group.group_id)}" title="${esc(membership.display[matrixField])}"><span>${esc(membership.display[matrixField] || '（空）')}</span><small>${esc(membership.display['member.role'])}${membership.matched ? ' · 匹配' : ''}</small></button></td>` : '<td class="matrix-absent">未加入</td>';
-        }).join('')}` : ''}
-        <td><button class="btn btn-sm btn-text" data-detail="${esc(row.id)}" type="button">资料</button></td></tr>`;
-    }).join('') || `<tr><td colspan="${identity.length + (matrix ? data.groups.length + 1 : 0) + 2}"><div class="empty"><strong>没有匹配的记录</strong><p>调整范围或条件后再试。</p></div></td></tr>`}
-    </tbody></table>`;
-}
-
-export function bindTable(element, data, selected, onSelection, onSort, onDetail) {
-  const pageCheck = element.querySelector('[data-check-page]');
-  const update = () => {
-    const checks = [...element.querySelectorAll('[data-check-row]')];
-    checks.forEach(check => { check.checked = selected.has(check.value); check.closest('tr').classList.toggle('selected', check.checked); });
-    const count = checks.filter(check => check.checked).length;
-    if (pageCheck) { pageCheck.checked = checks.length > 0 && count === checks.length; pageCheck.indeterminate = count > 0 && count < checks.length; }
-    onSelection?.();
-  };
-  element.querySelectorAll('[data-check-row]').forEach(check => check.addEventListener('change', () => { if (check.checked) selected.add(check.value); else selected.delete(check.value); update(); }));
-  pageCheck?.addEventListener('change', () => { data.items.forEach(row => { if (pageCheck.checked) selected.add(row.id); else selected.delete(row.id); }); update(); });
-  element.querySelectorAll('[data-sort]').forEach(cell => cell.addEventListener('click', () => onSort?.(cell.dataset.sort)));
-  element.querySelectorAll('[data-detail]').forEach(button => button.addEventListener('click', () => onDetail?.(data.items.find(row => row.id === button.dataset.detail), button.dataset.gid)));
-  update();
-}
-
 export async function showDetails(spec, row, gid) {
   const actualGid = gid || row.group_id;
   const body = { ...clone(spec), entity: row.qq ? 'memberships' : 'groups', filter: emptyRule(), search: '', details: true,
-    selected: [row.qq ? `${actualGid}:${row.qq}` : row.id], fields: catalog.fields.map(field => field.id), page: 1 };
+    scope: scopeContext([actualGid]), selected: [row.qq ? `${actualGid}:${row.qq}` : row.id], fields: catalog.fields.map(field => field.id), page: 1 };
   openDrawer({ title: row.qq ? `成员资料 · ${row.qq}` : `群聊资料 · ${row.id}`, wide: true,
     body: '<div class="skeleton" style="height:180px"></div>', footer: '<button class="btn" data-close="1">关闭</button>',
     onMount: async panel => {
@@ -182,9 +129,15 @@ export async function showDetails(spec, row, gid) {
         const data = await requestData('/api/query', body);
         const item = data.items[0];
         if (!item || !panel.isConnected) return;
-        const relevant = catalog.fields.filter(field => field.id.startsWith('group.') || (row.qq && field.id.startsWith('member.')));
-        panel.innerHTML = `<p class="tiny muted">常用字段来自资料归一化，扩展字段按原接口保存。显示“未采集”的字段可在工作台补全资料。</p><dl class="record-details">${relevant.filter(field => !field.id.includes('.raw.')).map(field => `<div><dt>${esc(field.label)}</dt><dd>${esc(item.display[field.id] || '（空）')}</dd></div>`).join('')}</dl>
-          <details class="raw-details"><summary>完整原始资料与接口状态</summary><pre>${esc(JSON.stringify(item.raw, null, 2))}</pre></details>`;
+        const sections = detailSections(catalog.fields, Boolean(row.qq));
+        const groupName = item.display['group.display_name'] || actualGid;
+        const sources = row.source_values || [];
+        const sourceHeader = sources.length ? `<section class="source-alternatives"><h3>本次列表中的昵称来源 ${new Set(sources.map(source=>source.text)).size>1 ? fieldStatusTag('来源有差异','warning') : ''}</h3>${sources.map((source,index)=>`<p>${groupTag(source.name,source.group_id)} → <strong>${esc(source.text)}</strong> ${index===0?fieldStatusTag('采用','info'):''}</p>`).join('')}</section>` : '';
+        const rawBlocks = [{label:'群聊接口原始资料与采集状态',value:{data:item.raw?.group,collection:item.raw?.collection?.group}}];
+        if(row.qq)rawBlocks.unshift({label:'本人成员接口原始资料与采集状态',value:{data:item.raw?.member,collection:item.raw?.collection?.members?.[row.qq]}});
+        panel.innerHTML = `${sourceHeader}${sections.map(section=>`<section class="detail-section" aria-labelledby="detail-${section.id}"><header class="detail-section-head"><div><h3 id="detail-${section.id}">${section.title}</h3><p>${section.description}</p></div>${section.id!=='personal'?groupTag(groupName,actualGid):''}</header><dl class="record-details">${section.fields.map(field=>`<div><dt>${esc(field.label)}</dt><dd>${renderField(item,field.id,'（空）')}</dd></div>`).join('')}</dl></section>`).join('')}
+          ${rawBlocks.map(block=>`<details class="raw-details"><summary>${block.label}</summary><pre>${esc(JSON.stringify(block.value,null,2))}</pre></details>`).join('')}`;
+
       } catch (error) { if (panel.isConnected) panel.innerHTML = errorBox(error); }
     },
   });
@@ -205,3 +158,26 @@ export const defaultSources = () => state.groups.filter(group => /^【师生】/
   .sort((a, b) => groupDisplayName(a).localeCompare(groupDisplayName(b), 'zh-CN', { numeric: true })).map(group => group.group_id);
 
 export function names(groupIds) { return groupIds.map(gid => groupDisplayName(state.groups.find(group => group.group_id === gid)) || gid); }
+
+export function showPersonDetails(spec, row, gid) {
+  if (gid) { showDetails(spec, row, gid); return; }
+  const memberships = row.memberships || [];
+  openDrawer({ title: `各群资料 · ${row.display?.['member.nickname'] || row.qq} · ${row.qq}`, wide: true,
+    body: `<p class="scope-description">在本次查看范围内加入 ${memberships.length} 个群。下面列出实际群关系，条件未匹配的记录仍保留。</p>
+      ${row.person?.source_values?.length ? `<details class="source-alternatives"><summary>昵称来源与采用顺序${row.person.source_conflict ? ' · 来源存在差异' : ''}</summary>${row.person.source_values.map((source,i) => `<p>${i+1}. ${groupTag(source.name,source.group_id)} → <strong>${esc(source.text)}</strong>${i===0?'（采用）':''}</p>`).join('')}</details>` : ''}<div id="person-memberships" class="scope-results"></div>`,
+    footer: '<button class="btn" data-close="1">关闭</button>',
+    onMount(panel) {
+      const data = { fields: catalog.fields, columns: ['group.display_name','member.card','member.role'], groups: [] };
+      const items = memberships.map(member => ({ ...member, id: `${member.group_id}:${row.qq}`, qq: row.qq,
+        display: { ...member.display, 'group.display_name': names([member.group_id])[0] },
+        values: { ...member.values, 'group.display_name': names([member.group_id])[0] } }));
+      const list = new ResultTable(panel.querySelector('#person-memberships'), { layoutKey:'person-memberships', onDetail: member => showDetails(spec, member, member.group_id) });
+      list.setLocal(items, dataColumns(data));
+    },
+  });
+}
+
+export function scopeCard(label, ids, button, description = '') {
+  const groupNames = names(ids);
+  return `<section class="task-scope-card"><div class="task-scope-head"><span>${label}</span><strong>${ids.length} 个群</strong><button class="btn btn-sm" id="${button}">选择群聊</button></div><div class="task-scope-names group-chip-list" title="${esc(groupNames.join('、'))}">${ids.length?ids.map((id,index)=>groupTag(groupNames[index],id)).join(''):'尚未选择群聊'}</div>${description ? `<small>${description}</small>` : ''}</section>`;
+}

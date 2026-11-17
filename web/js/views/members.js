@@ -1,136 +1,163 @@
-import { state, loadPrefs, savePrefs, groupDisplayName } from '../state.js';
-import { esc, fmtNumber } from '../ui.js';
-import { FilterBar, catalog, emptyRule, fieldSelectOptions } from '../filters.js';
-import { initialize, requestData, jobBanner, scopeContext, tableHtml, bindTable, showDetails, chooseColumns,
-  chooseGroups, exportData, collect, errorBox, defaultSources, names } from '../workspace.js';
+import { state, loadPrefs, savePrefs } from '../state.js';
+import { esc, fmtNumber, toast } from '../ui.js';
+import { FilterBar, catalog, emptyRule, fieldSelectOptions, clone } from '../filters.js';
+import { initialize, requestData, jobBanner, scopeContext, showDetails, showPersonDetails, chooseColumns,
+  chooseGroups, exportData, collect, errorBox, defaultSources, names, scopeCard } from '../workspace.js';
 import { openRename } from '../actions.js';
-import { bindAutoPage } from '../pagination.js';
+import { ResultTable, dataColumns } from '../result-table.js';
+import { mountComparison } from './member-comparison.js';
+import { groupTag } from '../field-display.js';
 
-let reload = null;
+let controller;
+const OVERVIEW_FIELDS = ['member.qq','member.nickname','person.group_count','person.group_names'];
+const DETAIL_FIELDS = ['member.qq','member.nickname','group.display_name','member.card','member.role','member.level','member.join_time','member.last_sent_time','member.title'];
+
+
+function migrate(old, available) {
+  const valid = ids => (ids || []).filter(id => available.has(id));
+  const groups = valid(old.groupIds || (state.group ? [state.group.group_id] : defaultSources()));
+  const source = valid(old.sources ?? defaultSources());
+  const sourceRule = JSON.stringify(old.rule || {}).match(/person\.(reference_card|source_group_id|source_conflict|nickname_difference)/);
+  return { task: 'overview', overview: { groupIds: groups, view: 'people', rule: sourceRule ? emptyRule() : old.rule || emptyRule(),
+      columns: OVERVIEW_FIELDS, detailColumns: old.columns || DETAIL_FIELDS, search: old.search || '', groupBy: old.groupBy || {} },
+    comparison: { sourceIds: source, targetIds: groups.filter(id => !source.includes(id)), rule: emptyRule(), status: 'missing', saved: [] },
+    rename: { sourceIds: source, targetIds: groups.filter(id => !source.includes(id)), rule: sourceRule ? old.rule : emptyRule(), method: 'sync', sourceField: 'member.card' } };
+}
 
 export async function render(container) {
   await initialize();
-  const key = `workbench.${state.session?.login?.user_id || 'local'}`;
-  const prefs = loadPrefs()[key] || {};
+  const account = state.session?.login?.user_id || 'local';
+  const key = `member-tasks.${account}`;
+  const allPrefs = loadPrefs();
   const available = new Set(state.groups.map(group => group.group_id));
+  const prefs = clone(allPrefs[key] || migrate(allPrefs[`workbench.${account}`] || {}, available));
+  for (const cfg of [prefs.overview,prefs.comparison,prefs.rename]) {
+    for (const prop of ['groupIds','sourceIds','targetIds']) if (cfg[prop]) cfg[prop] = cfg[prop].filter(id => available.has(id));
+  }
   const incoming = state.workbenchGroups ?? state.crossGroupTargets;
-  let groupIds = (incoming ?? prefs.groupIds ?? (state.group ? [state.group.group_id] : defaultSources())).filter(gid => available.has(gid));
-  state.workbenchGroups = state.crossGroupTargets = null;
-  let sources = (prefs.sources ?? defaultSources()).filter(gid => available.has(gid));
-  let mode = state.workbenchMode || prefs.mode || 'memberships';
-  state.workbenchMode = null;
-  let rule = prefs.rule || emptyRule();
-  let columns = prefs.columns || catalog.member_columns;
-  let matrixField = prefs.matrixField || 'member.card';
-  let sort = prefs.sort || { field: 'member.qq', desc: false };
-  let groupBy = prefs.groupBy || {};
-  let search = prefs.search || '';
-  let page = 1;
-  let selected = new Set();
-  let range = 'filtered';
-  let data = null;
-  let ticket = 0;
-  let loading = false;
-  let scrollLeft = 0;
-  container.innerHTML = `<div class="page members-workspace"><div class="page-head"><div><span class="eyebrow">MEMBER WORKSPACE</span><h1>成员工作台</h1><p>一套条件查看资料、比较群分布，并对结果执行操作。</p></div><div class="page-actions"><button class="btn" id="members-refresh">刷新名单</button><button class="btn btn-primary" id="members-rename">改群昵称</button></div></div>
-    <div class="scope-strip"><div><span class="eyebrow">查看范围</span><strong id="members-scope-label"></strong><span id="members-scope-names"></span></div><button class="btn btn-sm" id="members-scope">选择群聊</button><span class="scope-strip-divider"></span><details class="source-settings"><summary class="btn btn-sm">基准群与优先级 <span id="members-source-count"></span></summary><div class="source-settings-panel"><p class="tiny muted">参考资料按顺序采用第一个非空群昵称。基准可在查看范围外，不计入所在群数。</p><div id="members-sources"></div><div class="row"><button class="btn btn-sm" id="members-pick-sources">选择基准群</button><button class="btn btn-sm btn-text" id="members-default-sources">默认【师生】群</button><button class="btn btn-sm btn-text" id="members-include-sources">加入查看范围</button></div></div></details></div>
-    <section class="workspace-card"><div class="workspace-search"><div class="view-tabs"><button data-mode="memberships">成员明细</button><button data-mode="people">跨群分布</button></div><input class="input" id="members-search" placeholder="搜索昵称、群昵称、QQ号或群显示名" aria-label="搜索成员" value="${esc(search)}"/><span class="workspace-total" id="members-total">读取中</span></div><div id="members-filter" class="shared-filter"></div>
-      <div class="workspace-toolbar"><select class="input operation-range" id="members-range" aria-label="操作范围"><option value="filtered">当前全部筛选结果</option><option value="selected">仅勾选的记录</option></select><span id="members-selection" class="tiny muted"></span><button class="btn btn-sm btn-text" id="members-clear">取消勾选</button><span class="spacer"></span>
-        <label class="matrix-field-label" id="matrix-field-label">单元格字段<select class="input" id="matrix-field">${fieldSelectOptions(matrixField)}</select></label><button class="btn btn-sm" id="members-columns">字段</button>
-        <details class="display-options"><summary class="btn btn-sm">分组</summary><div><label>分组字段<select class="input" id="members-group-field"><option value="">不分组</option>${fieldSelectOptions(groupBy.field)}</select></label><label>提取分组的正则（可选）<input class="input mono" id="members-group-pattern" value="${esc(groupBy.pattern || '')}" placeholder="例如 ^(\\d{4})"/></label><button class="btn btn-sm" id="members-group-apply">应用分组</button></div></details>
-        <button class="btn btn-sm" id="members-copy">复制表格</button><select class="input format-select" id="members-format" aria-label="导出格式">${(state.config?.formats || ['csv']).map(format => `<option>${format}</option>`).join('')}</select><button class="btn btn-sm" id="members-export">导出</button></div>
-      <div id="members-progress" hidden></div><div class="table-wrap workspace-table" id="members-table"></div><div class="workspace-pagination"><span id="members-page" class="tiny muted"></span><span class="spacer"></span><button class="btn btn-sm" id="members-prev">上一页</button><button class="btn btn-sm" id="members-next">下一页</button></div></section>
-    <div class="workspace-secondary-actions"><button class="btn btn-text btn-sm" id="members-collect">补全范围内资料</button><button class="btn btn-text btn-sm" id="members-retry">重试采集失败项</button><span class="tiny faint" id="members-data-note"></span></div></div>`;
+  if (incoming) { prefs.overview.groupIds = incoming.filter(id => available.has(id)); prefs.task = 'overview'; }
+  if (state.workbenchMode) {
+    prefs.task = 'overview';
+    prefs.overview.view = state.workbenchMode;
+    if (incoming && state.workbenchMode === 'memberships') { prefs.overview.rule=emptyRule();prefs.overview.search='';prefs.overview.groupBy={}; }
+  }
+  if (state.pendingRename) { prefs.task = 'rename'; state.pendingRename = false; }
+  state.workbenchGroups = state.crossGroupTargets = state.workbenchMode = null;
+  const save = () => savePrefs({ [key]: prefs });
+  container.innerHTML = `<div class="page members-workspace"><div class="page-head"><div><span class="eyebrow">MEMBER WORKSPACE</span><h1>成员工作台</h1><p>先选择要做的事，再配置这次使用的群聊。</p></div></div>
+    <nav class="member-task-tabs" aria-label="成员管理任务"><button data-task="overview"><strong>人员总览</strong><span>查看所有人和各群资料</span></button><button data-task="comparison"><strong>群关系核对</strong><span>对照名单，检查缺少和名单外人员</span></button><button data-task="rename"><strong>改群昵称</strong><span>明确昵称来源与修改目标</span></button></nav><div id="member-task-body"></div></div>`;
   const root = container.querySelector('.members-workspace');
-  const table = root.querySelector('#members-table');
-  const progress = root.querySelector('#members-progress');
-  const spec = (useRange = false) => ({ entity: mode, scope: scopeContext(groupIds, sources), filter: rule, fields: columns, sort,
-    search, page, size: 50, matrix_field: matrixField, group_by: groupBy, selected: useRange && range === 'selected' ? [...selected] : undefined });
-  const save = () => savePrefs({ [key]: { groupIds, sources, mode, rule, columns, matrixField, sort, groupBy, search } });
-  const selection = () => {
-    root.querySelector('#members-selection').textContent = `已勾选 ${selected.size} ${mode === 'people' ? '人' : '条记录'}`;
-    root.querySelector('#members-clear').disabled = !selected.size;
-    const disabled = loading || !data?.total || (range === 'selected' && !selected.size);
-    for (const id of ['members-rename', 'members-copy', 'members-export']) root.querySelector(`#${id}`).disabled = disabled;
+  const mount = () => {
+    controller?.dispose();
+    root.querySelectorAll('[data-task]').forEach(button => { button.classList.toggle('active', button.dataset.task === prefs.task); button.setAttribute('aria-current', button.dataset.task === prefs.task ? 'page' : 'false'); });
+    const target = root.querySelector('#member-task-body');
+    controller = prefs.task === 'comparison' ? mountComparison(target, prefs.comparison, save) : mountList(target, prefs[prefs.task], save, prefs.task === 'rename');
+    save();
   };
-  const clear = () => { selected.clear(); range = 'filtered'; root.querySelector('#members-range').value = range; };
-  const paintScope = () => {
-    root.querySelector('#members-scope-label').textContent = `${groupIds.length} 个群`;
-    root.querySelector('#members-scope-names').textContent = names(groupIds).join('、') || '请先选择群聊';
-    root.querySelector('#members-source-count').textContent = `(${sources.length})`;
-    root.querySelector('#members-sources').innerHTML = sources.map((gid, index) => `<div class="source-order-row"><span>${index+1}</span><strong title="${esc(names([gid])[0])}">${esc(names([gid])[0])}</strong><button class="icon-btn" data-source-move="${esc(gid)}" data-step="-1" ${index ? '' : 'disabled'} title="提高优先级">↑</button><button class="icon-btn" data-source-move="${esc(gid)}" data-step="1" ${index < sources.length-1 ? '' : 'disabled'} title="降低优先级">↓</button></div>`).join('') || '<p class="tiny faint">尚未选择基准群。</p>';
-    root.querySelectorAll('[data-source-move]').forEach(button => button.addEventListener('click', () => {
-      const index = sources.indexOf(button.dataset.sourceMove), other = index + Number(button.dataset.step);
-      [sources[index], sources[other]] = [sources[other], sources[index]]; clear(); paintScope(); load();
-    }));
-  };
-  const load = async (force = false) => {
-    const token = ++ticket; loading = true; data = null;
-    if (table.querySelector('table')) scrollLeft = table.scrollLeft;
-    table.scrollTop = 0;
-    table.innerHTML = '<div class="skeleton table-loading"></div>';
-    root.querySelectorAll('[data-mode]').forEach(button => button.classList.toggle('active', button.dataset.mode === mode));
-    root.querySelector('#matrix-field-label').hidden = mode !== 'people';
-    root.querySelector('#members-prev').disabled = root.querySelector('#members-next').disabled = true;
-    selection(); save();
-    if (!groupIds.length) {
-      table.innerHTML = '<div class="empty"><strong>选择要查看的群聊</strong><p>可以选择单个群，也可以组合多个群。</p></div>';
-      root.querySelector('#members-total').textContent = '尚未选择群'; loading = false; selection(); return;
-    }
-    try {
-      const response = await requestData('/api/query', { ...spec(), refresh: force }, job => jobBanner(progress, job));
-      if (!root.isConnected || token !== ticket) return;
-      data = response; page = data.page;
-      table.innerHTML = tableHtml(data, selected, { matrix: mode === 'people', matrixField }); table.scrollLeft = scrollLeft;
-      bindTable(table, data, selected, () => { if (selected.size) { range = 'selected'; root.querySelector('#members-range').value = range; } selection(); },
-        field => { sort = { field, desc: sort.field === field ? !sort.desc : false }; load(); }, (row, gid) => showDetails(spec(), row, gid));
-      root.querySelector('#members-total').textContent = `${fmtNumber(data.people)} 人 · ${fmtNumber(data.memberships)} 条记录`;
-      root.querySelector('#members-page').textContent = `第 ${page} / ${data.pages} 页 · ${fmtNumber(data.total)} ${mode === 'people' ? '人' : '条群成员记录'}${data.pages > 1 ? page < data.pages ? ' · 触底自动下一页' : ' · 已到最后一页' : ''}`;
-      root.querySelector('#members-prev').disabled = page <= 1; root.querySelector('#members-next').disabled = page >= data.pages;
-      root.querySelector('#members-data-note').textContent = mode === 'people'
-        ? '矩阵保留真实群关系；“匹配”标记对应命中的记录，未标记的已有记录不会当成未加入。'
-        : data.groups.some(group => group.stale) ? '部分群使用旧缓存，可刷新名单；筛选需要额外资料时自动补全。' : '资料按需加载；未采集、采集失败与未提供分别显示。';
-      return true;
-    } catch (error) {
-      if (root.isConnected && token === ticket) { table.innerHTML = errorBox(error); root.querySelector('#members-total').textContent = '查询未完成'; }
-      return false;
-    } finally { if (token === ticket) { loading = false; selection(); } }
-  };
-  const changePage = async next => {
-    if (loading || !data || next < 1 || next > data.pages) return;
-    const previous = page;
-    page = next;
-    if (await load() === false) page = previous;
-  };
-  bindAutoPage(table, () => !loading && data && page < data.pages, () => changePage(page + 1));
-  reload = load;
-  new FilterBar(root.querySelector('#members-filter'), { rule, onApply(value) { rule = value; page = 1; clear(); load(); } });
-  root.querySelector('#members-scope').addEventListener('click', () => chooseGroups({ selected: groupIds, onApply(ids) { groupIds = ids; page = 1; clear(); scrollLeft = 0; paintScope(); load(); } }));
-  root.querySelector('#members-pick-sources').addEventListener('click', () => chooseGroups({ title: '选择基准群', selected: sources, onApply(ids) { sources = ids; clear(); paintScope(); load(); } }));
-  root.querySelector('#members-default-sources').addEventListener('click', () => { sources = defaultSources(); clear(); paintScope(); load(); });
-  root.querySelector('#members-include-sources').addEventListener('click', () => { groupIds = [...new Set([...sources, ...groupIds])]; clear(); paintScope(); load(); });
-  root.querySelector('#members-search').addEventListener('change', event => { search = event.target.value.trim(); page = 1; clear(); load(); });
-  root.querySelectorAll('[data-mode]').forEach(button => button.addEventListener('click', () => { mode = button.dataset.mode; page = 1; clear(); scrollLeft = 0; load(); }));
-  root.querySelector('#members-clear').addEventListener('click', () => { clear(); load(); });
-  root.querySelector('#members-range').addEventListener('change', event => { range = event.target.value; selection(); });
-  root.querySelector('#matrix-field').value = matrixField;
-  root.querySelector('#matrix-field').addEventListener('change', event => { matrixField = event.target.value; clear(); load(); });
-  root.querySelector('#members-columns').addEventListener('click', () => chooseColumns(columns, value => { columns = value; load(); }));
-  root.querySelector('#members-group-field').value = groupBy.field || '';
-  root.querySelector('#members-group-apply').addEventListener('click', () => {
-    groupBy = { field: root.querySelector('#members-group-field').value, pattern: root.querySelector('#members-group-pattern').value };
-    root.querySelector('.display-options').open = false; clear(); page = 1; load();
-  });
-  root.querySelector('#members-refresh').addEventListener('click', () => { clear(); load(true); });
-  root.querySelector('#members-prev').addEventListener('click', () => changePage(page - 1));
-  root.querySelector('#members-next').addEventListener('click', () => changePage(page + 1));
-  root.querySelector('#members-copy').addEventListener('click', () => exportData(spec(true), 'tsv', progress));
-  root.querySelector('#members-export').addEventListener('click', () => exportData(spec(true), root.querySelector('#members-format').value, progress));
-  root.querySelector('#members-rename').addEventListener('click', () => openRename(spec(true), progress, () => { clear(); load(true); }));
-  root.querySelector('#members-collect').addEventListener('click', () => collect(groupIds, progress, false, () => load()));
-  root.querySelector('#members-retry').addEventListener('click', () => collect(groupIds, progress, true, () => load()));
-  paintScope(); await load();
-  if (state.pendingRename) { state.pendingRename = false; if (data?.total) openRename(spec(true), progress, () => { clear(); load(true); }); }
+  root.querySelectorAll('[data-task]').forEach(button => button.addEventListener('click', () => { prefs.task = button.dataset.task; mount(); }));
+  mount();
 }
 
-export async function refresh() { await reload?.(true); }
+function mountList(container, cfg, save, renameTask) {
+  let data, list, ticket = 0, loading = false, ready = false;
+  const selected = new Set();
+  let range = 'filtered';
+  cfg.view ||= 'people'; cfg.method ||= 'sync'; cfg.rule ||= emptyRule(); cfg.groupBy ||= {}; cfg.sort ||= { field:'member.qq',desc:false };
+  const sync = () => renameTask && cfg.method === 'sync';
+  const ids = () => renameTask ? cfg.targetIds : cfg.groupIds;
+  const sources = () => sync() ? cfg.sourceIds : [];
+  const entity = () => !renameTask && cfg.view !== 'memberships' ? 'people' : 'memberships';
+  const fields = () => renameTask ? sync() ? cfg.syncColumns || ['member.qq','member.nickname','person.reference_text','person.source_group_name','member.card','person.source_conflict','group.display_name'] : cfg.otherColumns || DETAIL_FIELDS
+    : cfg.view === 'memberships' ? cfg.detailColumns || DETAIL_FIELDS : cfg.columns || OVERVIEW_FIELDS;
+  const spec = (useRange = false) => {
+    const quickRules = { different:{field:'person.nickname_difference',op:'eq',value:true}, conflict:{field:'person.source_conflict',op:'eq',value:true}, empty:{field:'person.reference_text',op:'empty'} };
+    const quick = sync() && quickRules[cfg.quick];
+    return { entity:entity(), scope:scopeContext(ids(),sources()), filter:quick ? { op:'and',rules:[cfg.rule,quick] } : cfg.rule,
+      fields:fields(), search:cfg.search || '', sort:cfg.sort, group_by:cfg.groupBy, matrix:!renameTask && cfg.view==='matrix', matrix_field:cfg.matrixField || 'member.card',
+      source_field:cfg.sourceField || 'member.card', selected:useRange && range==='selected' ? [...selected] : undefined };
+  };
+  container.innerHTML = `<div class="member-list-task"><div class="task-heading"><div><h2>${renameTask?'改群昵称':'人员总览'}</h2><p>${renameTask?'先选读取来源和修改目标，再预演逐条差异。':'默认每个 QQ 一行；同一个人在多个群中也能一次看清。'}</p></div><div class="row"><button class="btn" id="task-refresh">刷新名单</button>${renameTask?'<button class="btn btn-primary" id="task-rename">预演并改名</button>':''}</div></div>
+    ${renameTask?`<div class="rename-method-bar"><label>生成方式 <select class="input" id="task-method"><option value="sync">从来源群同步</option><option value="template">按变量模板</option><option value="mapping">按 CSV 名单</option></select></label><label id="task-source-field-label">读取字段 <select class="input" id="task-source-field">${fieldSelectOptions(cfg.sourceField || 'member.card')}</select></label></div><div class="task-scope-grid" id="task-scopes"></div><div class="task-nickname-quick" id="task-quick"></div>`:'<div id="task-scopes"></div>'}
+    <section class="workspace-card"><div class="workspace-search">${renameTask?'':`<select class="input task-display-mode" id="task-view" aria-label="人员显示方式"><option value="people">按人汇总</option><option value="memberships">群内明细</option><option value="matrix">逐群对照</option></select>`}<input class="input" id="task-search" aria-label="搜索成员" placeholder="搜索 QQ号、昵称、群昵称或群名" value="${esc(cfg.search || '')}"/><span class="workspace-total" id="task-total">读取中</span></div><div id="task-filter" class="shared-filter"></div>
+    <div class="workspace-toolbar"><select class="input operation-range" id="task-range" aria-label="操作范围"><option value="filtered">全部筛选结果</option><option value="selected">仅勾选的记录</option></select><span class="tiny muted" id="task-selection"></span><button class="btn btn-sm btn-text" id="task-clear">取消勾选</button><span class="spacer"></span><label class="matrix-field-label" id="task-matrix-label" hidden>单元格 <select class="input" id="task-matrix">${catalog.fields.filter(field=>field.id.startsWith('member.')).map(field=>`<option value="${esc(field.id)}">${esc(field.label)}</option>`).join('')}</select></label><button class="btn btn-sm" id="task-columns">字段</button>
+    <details class="display-options"><summary class="btn btn-sm">分组</summary><div><label>分组字段<select class="input" id="task-group-field"><option value="">不分组</option>${fieldSelectOptions(cfg.groupBy.field)}</select></label><label>提取分组的正则<input class="input" id="task-group-pattern" value="${esc(cfg.groupBy.pattern || '')}" placeholder="可选"/></label><button class="btn btn-sm" id="task-group-apply">应用分组</button></div></details><button class="btn btn-sm" id="task-copy">复制表格</button><select class="input format-select" id="task-format" aria-label="导出格式">${(state.config?.formats || ['csv']).map(format=>`<option>${format}</option>`).join('')}</select><button class="btn btn-sm" id="task-export">导出</button></div>
+    <div id="task-progress" hidden></div><div id="task-results"></div></section><div class="workspace-secondary-actions"><button class="btn btn-sm btn-text" id="task-collect">补全本次范围资料</button><button class="btn btn-sm btn-text" id="task-retry">重试采集失败项</button><span class="tiny faint">滚动条对应全部结果，可直接拖到中间或末尾。</span></div></div>`;
+  const root = container.querySelector('.member-list-task');
+  const host = root.querySelector('#task-results');
+  const progress = root.querySelector('#task-progress');
+  const selection = () => {
+    if (!root.isConnected) return;
+    root.querySelector('#task-selection').textContent = `已勾选 ${selected.size} ${entity()==='people'?'人':'条记录'}`;
+    root.querySelector('#task-clear').disabled = !selected.size;
+    const disabled = loading || !ready || !data?.total || range==='selected' && !selected.size;
+    for (const id of ['task-copy','task-export','task-rename']) { const button = root.querySelector(`#${id}`); if (button) button.disabled=disabled; }
+  };
+  const clear = () => { selected.clear(); range='filtered'; root.querySelector('#task-range').value=range; selection(); list?.schedule(); };
+  const paintScopes = () => {
+    root.querySelector('#task-scopes').innerHTML = renameTask
+      ? `${sync()?scopeCard('1 · 读取昵称的来源群',cfg.sourceIds,'task-pick-source','只读取，不修改；从上到下采用第一个非空值。'):''}${scopeCard(sync()?'2 · 准备修改的目标群':'准备修改的目标群',cfg.targetIds,'task-pick-target','只对这些群中符合条件的成员生成改名计划。')}`
+      : scopeCard('查看哪些群的成员',cfg.groupIds,'task-pick-target','所在群数和群关系仅统计本次查看范围。');
+    root.querySelector('#task-pick-target').addEventListener('click',()=>chooseGroups({title:renameTask?'选择准备修改的目标群':'选择查看范围',selected:ids(),excluded:sources(),onApply(value){if(renameTask)cfg.targetIds=value;else cfg.groupIds=value;clear();paintScopes();load();}}));
+    if (sync()) {
+      root.querySelector('#task-source-field-label').hidden=false;
+      root.querySelector('.task-scope-card').insertAdjacentHTML('beforeend',`<details class="priority-editor"><summary>调整来源优先级</summary>${cfg.sourceIds.map((gid,index)=>`<div class="source-order-row"><span>${index+1}</span><strong>${groupTag(names([gid])[0],gid)}</strong><button class="icon-btn" data-move-source="${index}" data-step="-1" ${index?'':'disabled'} aria-label="提高优先级">↑</button><button class="icon-btn" data-move-source="${index}" data-step="1" ${index<cfg.sourceIds.length-1?'':'disabled'} aria-label="降低优先级">↓</button></div>`).join('')}<button class="btn btn-sm btn-text" id="task-default-source">默认【师生】群</button></details>`);
+      root.querySelectorAll('[data-move-source]').forEach(button=>button.addEventListener('click',()=>{const i=Number(button.dataset.moveSource),j=i+Number(button.dataset.step);[cfg.sourceIds[i],cfg.sourceIds[j]]=[cfg.sourceIds[j],cfg.sourceIds[i]];clear();paintScopes();load();}));
+      const setSource=value=>{cfg.sourceIds=value;cfg.targetIds=cfg.targetIds.filter(id=>!value.includes(id));clear();paintScopes();load();};
+      root.querySelector('#task-pick-source').addEventListener('click',()=>chooseGroups({title:'选择读取昵称的来源群',selected:cfg.sourceIds,onApply:setSource}));
+      root.querySelector('#task-default-source').addEventListener('click',()=>setSource(defaultSources()));
+    } else if(renameTask) root.querySelector('#task-source-field-label').hidden=true;
+    if(renameTask) {
+      const quick = root.querySelector('#task-quick'); quick.hidden=!sync();
+      quick.innerHTML = [['all','全部'],['different','昵称不同'],['empty','无来源文本'],['conflict','来源冲突']].map(([id,label])=>`<button class="btn btn-sm ${cfg.quick===id||!cfg.quick&&id==='all'?'btn-primary':''}" data-quick="${id}">${label}</button>`).join('');
+      quick.querySelectorAll('[data-quick]').forEach(button=>button.addEventListener('click',()=>{cfg.quick=button.dataset.quick;clear();paintScopes();load();}));
+    }
+  };
+  const load = async (force=false) => {
+    const token=++ticket;loading=true;ready=false;selection();save();host.classList.add('is-loading');
+    root.querySelector('#task-matrix-label').hidden=renameTask||cfg.view!=='matrix';
+    root.querySelector('#task-columns').hidden=!renameTask&&cfg.view==='matrix';
+    if(!ids().length || sync()&&!sources().length) {
+      list?.destroy();data=null;host.innerHTML=`<div class="empty"><strong>${sync()&&!sources().length?'选择读取昵称的来源群':'选择需要查看或修改的群'}</strong><p>上方分别选择这次使用的群聊。</p></div>`;
+      root.querySelector('#task-total').textContent='尚未设置范围'; loading=false;host.classList.remove('is-loading');selection();return;
+    }
+    try {
+      const response=await requestData('/api/query/start',{...spec(),refresh:force},job=>jobBanner(progress,job));
+      if(!root.isConnected||token!==ticket)return;
+      data=response;ready=true;list?.destroy();
+      list=new ResultTable(host,{selected,sort:cfg.sort,layoutKey:renameTask?`rename:${sync()?'sync':'other'}`:`members:${cfg.view}`,onSelection:()=>{if(selected.size){range='selected';root.querySelector('#task-range').value=range;}selection();},
+        onReload:()=>load(),onSort:field=>{cfg.sort={field,desc:cfg.sort.field===field?!cfg.sort.desc:false};clear();load();},
+        onDetail:(row,gid)=>entity()==='people'?showPersonDetails(spec(),row,gid):showDetails(spec(),row,gid)});
+      list.setData(data,dataColumns(data,{selected,matrix:!renameTask&&cfg.view==='matrix',matrixField:cfg.matrixField||'member.card',overview:!renameTask&&cfg.view==='people'}));
+      root.querySelector('#task-total').textContent=`${fmtNumber(data.people)} 人 · ${fmtNumber(data.memberships)} 条群记录`;
+    } catch(error) {ready=false;if(root.isConnected&&token===ticket){if(!data)host.innerHTML=errorBox(error);else toast('查询未完成，仍显示上次结果','err',error.message+' '+(error.hint||''));}}
+    finally {if(token===ticket){loading=false;host.classList.remove('is-loading');selection();}}
+  };
+  new FilterBar(root.querySelector('#task-filter'),{rule:cfg.rule,context:renameTask?'rename':'overview',onApply(rule){cfg.rule=rule;clear();load();}});
+  root.querySelector('#task-search').addEventListener('change',event=>{cfg.search=event.target.value.trim();clear();load();});
+  root.querySelector('#task-range').addEventListener('change',event=>{range=event.target.value;selection();});
+  root.querySelector('#task-clear').addEventListener('click',clear);
+  root.querySelector('#task-refresh').addEventListener('click',()=>{clear();load(true);});
+  root.querySelector('#task-columns').addEventListener('click',()=>chooseColumns(fields(),value=>{if(renameTask){if(sync())cfg.syncColumns=value;else cfg.otherColumns=value;}else if(cfg.view==='memberships')cfg.detailColumns=value;else cfg.columns=value;clear();load();},entity()));
+  root.querySelector('#task-group-field').value=cfg.groupBy.field||'';
+  root.querySelector('#task-group-apply').addEventListener('click',()=>{cfg.groupBy={field:root.querySelector('#task-group-field').value,pattern:root.querySelector('#task-group-pattern').value};root.querySelector('.display-options').open=false;clear();load();});
+  root.querySelector('#task-matrix').value=cfg.matrixField||'member.card';
+  root.querySelector('#task-matrix').addEventListener('change',event=>{cfg.matrixField=event.target.value;clear();load();});
+  root.querySelector('#task-copy').addEventListener('click',()=>exportData({query_id:data.query_id,selected:range==='selected'?[...selected]:undefined},'tsv',progress));
+  root.querySelector('#task-export').addEventListener('click',()=>exportData({query_id:data.query_id,selected:range==='selected'?[...selected]:undefined},root.querySelector('#task-format').value,progress));
+  root.querySelector('#task-collect').addEventListener('click',()=>collect([...new Set([...ids(),...sources()])],progress,false,()=>load()));
+  root.querySelector('#task-retry').addEventListener('click',()=>collect([...new Set([...ids(),...sources()])],progress,true,()=>load()));
+  if(renameTask) {
+    root.querySelector('#task-method').value=cfg.method;
+    root.querySelector('#task-source-field').value=cfg.sourceField||'member.card';
+    root.querySelector('#task-method').addEventListener('change',event=>{cfg.method=event.target.value;if(sync())cfg.targetIds=cfg.targetIds.filter(id=>!cfg.sourceIds.includes(id));clear();paintScopes();load();});
+    root.querySelector('#task-source-field').addEventListener('change',event=>{cfg.sourceField=event.target.value;clear();load();});
+    root.querySelector('#task-rename').addEventListener('click',()=>openRename(spec(true),progress,()=>{clear();load(true);},{method:cfg.method,source_field:cfg.sourceField}));
+  } else {
+    root.querySelector('#task-view').value=cfg.view;
+    root.querySelector('#task-view').addEventListener('change',event=>{cfg.view=event.target.value;clear();load();});
+  }
+  paintScopes();load();
+  return {dispose(){ticket++;list?.destroy();},refresh:()=>{clear();return load(true);}};
+}
+
+export async function refresh() { await controller?.refresh(); }

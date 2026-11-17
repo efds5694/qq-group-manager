@@ -13,7 +13,7 @@ from .core.errors import AppError
 from .onebot import adapters, probe
 from .onebot.client import OneBotClient
 from .server import Request, Response, Router
-from .services import cards, groups, groupsettings, jobs, members, query, collection, presets, rename
+from .services import cards, groups, groupsettings, jobs, members, query, collection, presets, rename, results, comparison
 
 _STATE: dict = {"client": None, "key": None, "session": None}
 _LOCK = threading.RLock()
@@ -147,6 +147,42 @@ def api_query(request: Request):
     return query.execute(dataset, request.body)
 
 
+def _result_owner():
+    session = _session()
+    client, _ = _active_client()
+    return (client.cache_namespace, str(session["login"]["user_id"]))
+
+
+def api_query_start(request: Request):
+    dataset, pending = _query_data(request.body)
+    if pending:
+        return {"pending": True, "job": pending}
+    result = query.execute(dataset, request.body, paginate=False)
+    result["entity"] = dataset["entity"]
+    result["matrix"] = bool(request.b("matrix"))
+    return results.STORE.create(_result_owner(), result, request.body)
+
+
+def api_result_window(request: Request, query_id: str):
+    return results.STORE.window(_result_owner(), query_id, request.q("offset", "0"), request.q("limit", "200"))
+
+
+def api_members_compare(request: Request):
+    sources = list(dict.fromkeys(str(gid) for gid in request.b("source_group_ids", [])))
+    targets = list(dict.fromkeys(str(gid) for gid in request.b("target_group_ids", [])))
+    if not sources or not targets:
+        raise AppError("请选择名单来源群和待核对群")
+    spec = {"entity": "memberships", "scope": {"group_ids": sources, "source_group_ids": targets,
+             "show_remark": request.b("show_remark", True)}, "filter": request.b("source_filter"),
+             "refresh": bool(request.b("refresh"))}
+    dataset, pending = _query_data(spec)
+    if pending:
+        return {"pending": True, "job": pending}
+    if any(gid not in dataset["all_groups"] for gid in targets):
+        raise AppError("部分待核对群已不在当前账号群列表中")
+    return results.STORE.create(_result_owner(), comparison.build(dataset, request.body), request.body)
+
+
 def api_fields(request: Request):
     from .core.filters import OPERATORS
     return {"fields": fields.FIELDS, "operators": OPERATORS,
@@ -154,16 +190,28 @@ def api_fields(request: Request):
 
 
 def api_query_export(request: Request):
-    dataset, pending = _query_data(request.body)
-    if pending:
-        return {"pending": True, "job": pending}
-    result = query.execute(dataset, request.body, paginate=False)
+    if request.b("query_id"):
+        entry = results.STORE.get(_result_owner(), request.b("query_id"))
+        result = entry["result"]
+        entity = result.get("entity")
+        matrix_key = entry["spec"].get("matrix_field", "member.card")
+        matrix = result.get("matrix", False)
+        if request.b("selected") is not None:
+            chosen = set(request.b("selected"))
+            result = {**result, "items": [item for item in result["items"] if item["id"] in chosen]}
+    else:
+        dataset, pending = _query_data(request.body)
+        if pending:
+            return {"pending": True, "job": pending}
+        result = query.execute(dataset, request.body, paginate=False)
+        entity = dataset["entity"]
+        matrix_key = request.b("matrix_field", "member.card")
+        matrix = entity == "people"
     definitions = {item["id"]: item for item in result["fields"]}
     columns = result["columns"]
     header = [definitions[key]["label"] for key in columns]
     rows = [[item["display"][key] for key in columns] for item in result["items"]]
-    if dataset["entity"] == "people":
-        matrix_key = request.b("matrix_field", "member.card")
+    if entity == "people" and matrix:
         for group in result["groups"]:
             header.append(f'{definitions.get(matrix_key, {}).get("label", matrix_key)}·{group["name"]}（{group["group_id"]}）')
         for line, item in zip(rows, result["items"]):
@@ -784,6 +832,9 @@ def api_delete_template(request: Request, template_id: str):
 def build_router() -> Router:
     router = Router()
     router.add("POST", r"^/api/query$", api_query)
+    router.add("POST", r"^/api/query/start$", api_query_start)
+    router.add("GET", r"^/api/query/results/(?P<query_id>[a-f0-9]+)$", api_result_window)
+    router.add("POST", r"^/api/members/compare$", api_members_compare)
     router.add("POST", r"^/api/query/export$", api_query_export)
     router.add("GET", r"^/api/fields$", api_fields)
     router.add("GET", r"^/api/filter-presets$", api_presets)

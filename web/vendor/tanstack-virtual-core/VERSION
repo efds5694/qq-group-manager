@@ -1,0 +1,3 @@
+3.19.11
+https://www.npmjs.com/package/@tanstack/virtual-core
+Browser production build: process.env.NODE_ENV replaced with the literal "production".

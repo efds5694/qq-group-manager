@@ -43,13 +43,13 @@ def preview(dataset, spec, self_id, interval=2):
     source_order = (query_spec.get("scope") or {}).get("source_group_ids", [])
     sources = set(source_order)
     if method == "sync" and not sources:
-        raise AppError("请选择基准群")
+        raise AppError("请选择昵称来源群")
     contexts = {record["id"]: record for record in dataset["source_records"]}
     target_ids = list(dataset["groups"])
     if method == "sync":
         target_ids = [gid for gid in target_ids if gid not in sources]
     if not target_ids:
-        raise AppError("没有目标群", hint="基准群只作来源，请选择其他群作为查看和修改范围。")
+        raise AppError("没有目标群", hint="来源群只读，请选择准备修改的其他目标群。")
     items, skipped, warnings = [], [], []
     for gid in target_ids:
         group = dataset["groups"][gid]
@@ -74,7 +74,7 @@ def preview(dataset, spec, self_id, interval=2):
                 if not text:
                     reason = "名单中没有对应的新群昵称"
             elif method == "sync" and not source_id:
-                text, reason = "", "没有非空基准群昵称"
+                text, reason = "", "没有非空来源文本"
             else:
                 val = fields.value(source_record, source_key)
                 text = "" if val is fields.MISSING else fields.display(val, fields.BY_ID.get(source_key))
@@ -96,7 +96,13 @@ def preview(dataset, spec, self_id, interval=2):
         plan = cards.preview(legacy, {**group, "group_name": group["display_name"]},
                              {"scope": "mapping", "mapping": mapping}, self_id, role, interval)
         for item in plan["items"]:
-            item.update(group_id=gid, group_name=group["display_name"], source_group_id=source_lookup[item["qq"]])
+            source_gid = source_lookup[item["qq"]]
+            source_record = contexts.get(f'{source_gid}:{item["qq"]}')
+            person = contexts[f'{gid}:{item["qq"]}']["person"]
+            item.update(group_id=gid, group_name=group["display_name"], source_group_id=source_gid,
+                        source_group_name=dataset["all_groups"].get(source_gid, {}).get("display_name", ""),
+                        source_text=fields.display(fields.value(source_record, options.get("source_field", "member.card"))) if source_record else "",
+                        source_conflict=person["source_conflict"], source_values=person.get("source_values", []))
         for item in plan["skipped"]:
             item.update(group_id=gid, group_name=group["display_name"])
         items.extend(plan["items"])
