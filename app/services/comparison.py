@@ -63,6 +63,7 @@ def build(dataset, spec):
                       "detail_group_id": (target or source)["group"]["group_id"], "values": values, "display": display})
     return {"entity": "comparison", "items": items, "total": len(items), "columns": COLUMNS,
             "data_at": min(entry["fetched_at"] for entry in dataset["entries"].values()),
+            "data_at_end": max(entry["fetched_at"] for entry in dataset["entries"].values()),
             "stale": any(entry.get("stale") for entry in dataset["entries"].values()),
             "fields": dataset["fields"], "groups": summaries, "summaries": summaries, "expected": len(expected),
             "target_group_id": active, "status": status, "people": len(items), "memberships": len(items)}

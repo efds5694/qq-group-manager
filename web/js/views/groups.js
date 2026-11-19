@@ -1,15 +1,18 @@
 import { state, loadPrefs, savePrefs } from '../state.js';
-import { navigate } from '../router.js';
-import { esc, toast, fmtNumber } from '../ui.js';
-import { FilterBar, catalog, emptyRule, fieldSelectOptions } from '../filters.js';
-import { initialize, requestData, jobBanner, scopeContext, showDetails, chooseColumns, exportData, collect, errorBox, allResultRows } from '../workspace.js';
+import { navigate, routeParams } from '../router.js';
+import * as api from '../api.js';
+import { toast, actionMenu } from '../ui.js';
+import { catalog, emptyRule } from '../filters.js';
+import { initialize, requestData, ResultQuery, scopeContext, showDetails, chooseColumns, collect } from '../workspace.js';
 import { openGroupSettings } from '../actions.js';
-import { ResultTable, dataColumns } from '../result-table.js';
+import { ResultTable, dataColumns, readResultIds, retainSelection } from '../result-table.js';
+import { GROUP_SEARCH, mountQueryBar } from '../search-controls.js';
+import { mountDisplayOptions, mountResultActions } from '../result-controls.js';
 
-let reload = null;
+let controller;
 
 export async function render(container) {
-  await initialize();
+  await initialize(container);
   const key = `catalog.${state.session?.login?.user_id || 'local'}`;
   const prefs = loadPrefs()[key] || {};
   let rule = prefs.rule || emptyRule();
@@ -17,79 +20,131 @@ export async function render(container) {
   let sort = prefs.sort || { field: 'group.display_name', desc: false };
   let groupBy = prefs.groupBy || {};
   let search = prefs.search || '';
-  let data = null;
-  let selected = new Set();
-  let ticket = 0;
-  let loading = false;
-  let ready = false;
-  let list;
-  container.innerHTML = `<div class="page directory-page"><div class="page-head"><div><span class="eyebrow">GROUP DIRECTORY</span><h1>群聊目录</h1><p>统一查看群资料，选择群后进入成员工作台。</p></div><div class="page-actions"><button class="btn" id="directory-refresh">刷新群列表</button><button class="btn btn-primary" id="directory-open">查看成员</button></div></div>
-    <section class="workspace-card"><div class="workspace-search"><input class="input" id="directory-search" placeholder="搜索群名称、群备注、群号" aria-label="搜索群聊" value="${esc(search)}"/><span class="workspace-total" id="directory-total">读取中</span></div><div id="directory-filter" class="shared-filter"></div>
-    <div class="workspace-toolbar"><span id="directory-selection" class="tiny muted"></span><button class="btn btn-sm btn-text" id="directory-clear">取消选择</button><span class="spacer"></span><button class="btn btn-sm" id="directory-columns">字段</button><details class="display-options"><summary class="btn btn-sm">分组</summary><div><label>分组字段<select class="input" id="directory-group-field"><option value="">不分组</option>${fieldSelectOptions(groupBy.field)}</select></label><label>提取分组的正则（可选）<input class="input mono" id="directory-group-pattern" value="${esc(groupBy.pattern || '')}" placeholder="^【(.+?)】"/></label><button class="btn btn-sm" id="directory-group-apply">应用分组</button></div></details>
-      <button class="btn btn-sm" id="directory-copy">复制表格</button><select class="input format-select" id="directory-format" aria-label="导出格式">${(state.config?.formats || ['csv']).map(format => `<option>${format}</option>`).join('')}</select><button class="btn btn-sm" id="directory-export">导出</button><button class="btn btn-sm" id="directory-settings">群设置</button><button class="btn btn-sm" id="directory-favorite">收藏／取消收藏</button></div>
-    <div id="directory-progress" hidden></div><div class="table-wrap workspace-table" id="directory-table"></div></section>
-    <div class="workspace-secondary-actions"><button class="btn btn-text btn-sm" id="directory-collect">补全所选群资料</button><button class="btn btn-text btn-sm" id="directory-retry">重试采集失败项</button><span class="tiny faint">预设与成员工作台共享；各视图分别记住当前条件。</span></div></div>`;
+  let data, list;
+  const selected = new Set();
+  let pendingFocus = routeParams().get('focus') || '', temporaryFocus = '';
+  container.innerHTML = `<div class="page directory-page"><div class="page-head"><h1>群聊目录</h1><button class="btn" data-refresh-view>刷新</button></div>
+    <section class="workspace-card"><div id="directory-query"></div><div id="directory-actions"></div>
+    <div id="directory-progress" hidden></div><div id="directory-operation" hidden></div><div id="directory-table"></div></section></div>`;
   const root = container.querySelector('.directory-page');
   const table = root.querySelector('#directory-table');
-  const progress = root.querySelector('#directory-progress');
-  const spec = () => ({ entity: 'groups', scope: scopeContext([]), filter: rule, fields: columns, sort, search, group_by: groupBy });
-  const save = () => savePrefs({ [key]: { rule, columns, sort, groupBy, search } });
-  const selection = () => {
-    if (!root.isConnected) return;
-    root.querySelector('#directory-selection').textContent = selected.size ? `已选 ${selected.size} 个群` : '未勾选时，查看成员、复制和导出使用当前全部筛选结果';
-    root.querySelector('#directory-clear').disabled = !selected.size;
-    for (const id of ['directory-settings', 'directory-favorite', 'directory-collect', 'directory-retry']) root.querySelector(`#${id}`).disabled = !selected.size || loading;
-    for (const id of ['directory-open', 'directory-copy', 'directory-export']) root.querySelector(`#${id}`).disabled = loading || !ready || !data?.total;
-  };
-  const load = async (force = false) => {
-    const token = ++ticket; loading = true; ready = false; selection(); table.classList.add('is-loading');
-    save();
-    try {
-      const response = await requestData('/api/query/start', { ...spec(), refresh: force }, job => jobBanner(progress, job));
-      if (!root.isConnected || token !== ticket) return;
-      data = response; ready = true;
-      list?.destroy();
-      list = new ResultTable(table, { selected, sort, layoutKey:'directory', onSelection: selection, onReload: () => load(),
-        onSort: field => { sort = { field, desc: sort.field === field ? !sort.desc : false }; load(); },
-        onRowDoubleClick: row => { state.workbenchGroups=[row.group_id]; state.workbenchMode='memberships'; navigate('members'); },
-        onDetail: row => showDetails(spec(), row) });
-      list.setData(data, dataColumns(data, { selected }));
-      root.querySelector('#directory-total').textContent = `${fmtNumber(data.total)} 个群`;
-    } catch (error) {
-      ready = false;
-      if (root.isConnected && token === ticket) { if (!data) table.innerHTML = errorBox(error); else toast(error.message, 'err', error.hint); }
-    } finally { if (token === ticket) { loading = false; table.classList.remove('is-loading'); selection(); } }
-  };
-  reload = load;
-  new FilterBar(root.querySelector('#directory-filter'), { rule, entity: 'groups', onApply(value) { rule = value; selected.clear(); load(); } });
-  root.querySelector('#directory-search').addEventListener('change', event => { search = event.target.value.trim(); selected.clear(); load(); });
-  root.querySelector('#directory-refresh').addEventListener('click', () => { selected.clear(); load(true); });
-  root.querySelector('#directory-clear').addEventListener('click', () => { selected.clear(); list?.schedule(); selection(); });
-  root.querySelector('#directory-columns').addEventListener('click', () => chooseColumns(columns, value => { columns = value; load(); }, 'groups'));
-  root.querySelector('#directory-group-field').value = groupBy.field || '';
-  root.querySelector('#directory-group-apply').addEventListener('click', () => {
-    groupBy = { field: root.querySelector('#directory-group-field').value, pattern: root.querySelector('#directory-group-pattern').value };
-    root.querySelector('.display-options').open = false; selected.clear(); load();
+  const progress = root.querySelector('#directory-operation');
+  const spec = (focus = temporaryFocus) => ({
+    entity: 'groups', scope: scopeContext([]), fields: columns, sort, group_by: groupBy,
+    filter: focus ? { field: 'group.group_id', op: 'eq', value: focus } : rule, search: focus ? '' : search,
   });
-  root.querySelector('#directory-copy').addEventListener('click', () => exportData({ query_id: data.query_id, selected: selected.size ? [...selected] : undefined }, 'tsv', progress));
-  root.querySelector('#directory-export').addEventListener('click', () => exportData({ query_id: data.query_id, selected: selected.size ? [...selected] : undefined }, root.querySelector('#directory-format').value, progress));
+  const save = () => savePrefs({ [key]: { rule, columns, sort, groupBy, search } });
+  const clear = () => { selected.clear(); actions.resetRange(); list?.schedule(); selection(); };
+  const query = new ResultQuery(root.querySelector('#directory-progress'), {
+    isActive: () => root.isConnected,
+    onChange() { list?.setLoading(!query.ready); selection(); },
+  });
+  const bar = mountQueryBar(root.querySelector('#directory-query'), {
+    search: { label: '搜索群聊', placeholder: GROUP_SEARCH, value: search, onSubmit(value) { search = value; clear(); load(); } },
+    filter: { rule, entity: 'groups', onApply(value) { rule = value; clear(); load(); } },
+    tools: '<div id="directory-display"></div><span class="tiny muted" id="directory-focus" hidden>定位群聊</span><button class="btn btn-sm" id="directory-restore" hidden>恢复原筛选</button>',
+  });
+  mountDisplayOptions(root.querySelector('#directory-display'), {
+    groupBy, chooseColumns: () => chooseColumns(columns, value => { columns = value; load(); }, 'groups'),
+    onGroup(value) { groupBy = value; load(); },
+  });
+  const actions = mountResultActions(root.querySelector('#directory-actions'), {
+    selected, progress, onClear: clear,
+    tools: `<button class="btn btn-sm btn-primary" id="directory-open">查看成员</button>
+      <button class="btn btn-sm" id="directory-settings" data-directory-selected>群设置</button>
+      ${actionMenu('更多', '<button class="btn btn-sm" id="directory-favorite" data-directory-selected>收藏／取消收藏</button><button class="btn btn-sm" id="directory-collect" data-directory-selected>补全所选群资料</button><button class="btn btn-sm" id="directory-retry" data-directory-selected>重试采集失败项</button>')}`,
+  });
+  function selection() {
+    if (!root.isConnected) return;
+    const busy = query.loading || Boolean(list?.selectionBusy);
+    actions.update({ data, ready: query.ready, busy, unit: '个群' });
+    root.querySelector('#directory-open').disabled = !actions.usable();
+    for (const button of root.querySelectorAll('[data-directory-selected]')) button.disabled = !actions.usable() || !selected.size;
+    bar.setSuspended(Boolean(temporaryFocus));
+    root.querySelector('#directory-focus').hidden = !temporaryFocus;
+    root.querySelector('#directory-restore').hidden = !temporaryFocus;
+  }
+  function load(force = false) {
+    if (!root.isConnected) return;
+    save();
+    const position = (response, id) => api.get(`/api/query/results/${response.query_id}/position`, { id });
+    return query.run(async (report, current) => {
+      const request = (focus, refresh) => requestData('/api/query/start', { ...spec(focus), refresh }, report, current);
+      let response = await request(temporaryFocus, force);
+      if (!current()) return;
+      let offset = null, focus = temporaryFocus;
+      const id = pendingFocus;
+      if (id) {
+        ({ index: offset } = await position(response, id));
+        if (!current()) return;
+        if (offset === null) {
+          const focused = await request(id, false);
+          if (!current()) return;
+          ({ index: offset } = await position(focused, id));
+          if (!current()) return;
+          if (offset !== null) { focus = id; response = focused; }
+        }
+      }
+      const selectionIds = selected.size ? await readResultIds(response) : null;
+      return { response, offset, focus, id, selectionIds };
+    }, ({ response, offset, focus, id, selectionIds }) => {
+      if (selectionIds) retainSelection(selected, selectionIds);
+      if (id && offset === null) toast('该群不在当前账号的群聊目录中', 'warn');
+      if (id && offset !== null) selected.add(id);
+      temporaryFocus = focus;
+      pendingFocus = '';
+      data = selectionIds ? { ...response, selection_ids: selectionIds } : response;
+      list?.destroy();
+      list = new ResultTable(table, {
+        selected, sort, layoutKey: 'directory', onSelection: selection, onReload: () => load(),
+        onSort: field => { sort = { field, desc: sort.field === field ? !sort.desc : false }; load(); },
+        onRowDoubleClick(row) {
+          if (!query.ready) return;
+          state.workbenchGroups = [row.group_id];
+          state.workbenchMode = 'memberships';
+          navigate('members');
+        },
+        onDetail: row => { if (query.ready) showDetails(spec(), row); },
+      });
+      list.setData(data, dataColumns(data, { selected, search: spec().search }));
+      if (offset !== null) {
+        const current = list;
+        requestAnimationFrame(() => {
+          if (list === current && !current.disposed && query.ready) current.vertical.scrollToIndex(offset, { align: 'center' });
+        });
+      }
+    }, () => load(force));
+  }
+
+  root.querySelector('#directory-restore').addEventListener('click', () => navigate('groups'));
   root.querySelector('#directory-open').addEventListener('click', async () => {
     try {
-      const ids = selected.size ? [...selected] : (await allResultRows(data)).map(row => row.id);
-      state.workbenchGroups = ids; navigate('members');
+      const ids = await actions.resolveIds(list);
+      if (!ids?.length) return;
+      state.workbenchGroups = ids;
+      navigate('members');
     } catch (error) { toast(error.message, 'err', error.hint); }
   });
-  root.querySelector('#directory-settings').addEventListener('click', () => openGroupSettings([...selected], progress));
+  root.querySelector('#directory-settings').addEventListener('click', () => openGroupSettings([...selected], progress, () => load(true)));
   root.querySelector('#directory-favorite').addEventListener('click', () => {
     const favorites = new Set(loadPrefs().favoriteGroups || []);
     const remove = [...selected].every(gid => favorites.has(gid));
     selected.forEach(gid => { if (remove) favorites.delete(gid); else favorites.add(gid); });
-    savePrefs({ favoriteGroups: [...favorites] }); load();
+    savePrefs({ favoriteGroups: [...favorites] });
+    load();
   });
   root.querySelector('#directory-collect').addEventListener('click', () => collect([...selected], progress, false, () => load()));
   root.querySelector('#directory-retry').addEventListener('click', () => collect([...selected], progress, true, () => load()));
-  await load();
-  if (state.pendingGroupSettings) { state.pendingGroupSettings = false; if (state.group) openGroupSettings([state.group.group_id], progress); }
+  controller = {
+    refresh: () => load(true),
+    dispose() { query.dispose(); list?.destroy(); },
+  };
+  load().then(() => {
+    if (!root.isConnected || !state.pendingGroupSettings) return;
+    state.pendingGroupSettings = false;
+    if (state.group) openGroupSettings([state.group.group_id], progress, () => load(true));
+  });
 }
 
-export async function refresh() { await reload?.(true); }
+export async function refresh() { await controller?.refresh(); }
+export function dispose() { controller?.dispose(); controller = null; }

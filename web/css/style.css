@@ -1,48 +1,4 @@
-/* ==========================================================================
-   QQ 群管理工具 · 深色侧栏 + 浅色工作台
-   设计令牌集中在 :root，改主题只动这一块
-   ========================================================================== */
-
-:root {
-  --primary: #2f4bff;
-  --primary-dark: #1e33cc;
-  --primary-soft: #eef1ff;
-  --primary-line: #d5dbff;
-
-  --bg: #f6f7fb;
-  --surface: #ffffff;
-  --surface-2: #fbfbfe;
-  --sidebar: #12162b;
-  --sidebar-2: #1a1f3a;
-  --sidebar-line: #262c4a;
-
-  --text: #141824;
-  --muted: #5a6072;
-  --faint: #8a90a2;
-  --line: #e7e9f2;
-  --line-strong: #d6d9e6;
-
-  --ok: #16a34a;
-  --ok-soft: #e8f7ee;
-  --danger: #e5484d;
-  --danger-soft: #fdeced;
-  --warn: #f59e0b;
-  --warn-soft: #fef5e5;
-  --teal: #0ea5a5;
-  --teal-soft: #e5f7f7;
-  --indigo: #4f46e5;
-
-  --radius-sm: 8px;
-  --radius: 12px;
-  --radius-lg: 14px;
-  --shadow-sm: 0 1px 2px rgba(20, 24, 36, .04), 0 1px 3px rgba(20, 24, 36, .03);
-  --shadow: 0 4px 18px rgba(20, 24, 36, .06), 0 1px 2px rgba(20, 24, 36, .04);
-  --shadow-lg: 0 24px 60px rgba(18, 22, 43, .18);
-
-  --mono: "JetBrains Mono", "Cascadia Mono", Consolas, "Courier New", monospace;
-  --sans: "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
-}
-
+/* 基础布局与组件；配色及设计变量集中在 theme.css。 */
 * { box-sizing: border-box; }
 
 html, body {

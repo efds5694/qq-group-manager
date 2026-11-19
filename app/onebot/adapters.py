@@ -13,10 +13,12 @@ ADAPTERS: dict[str, dict] = {
         "auth": "bearer",
         "actions": {
             "notice_write": "_send_group_notice",
-            "notice_read": "get_group_notice",
+            "notice_read": "_get_group_notice",
             "portrait": "set_group_portrait",
             "add_option": "set_group_add_option",
-            "search_option": "set_group_search_option",
+            "search_option": "set_group_search",
+            "invite_policy": "set_group_member_invite_policy",
+            "admin": "set_group_admin",
             "group_info": "get_group_info",
         },
         "declared": {
@@ -24,6 +26,10 @@ ADAPTERS: dict[str, dict] = {
             "portrait": True,
             "add_option": True,
             "search_option": True,
+            "invite_policy": True,
+            "admin": True,
+            "admin_permissions": False,
+            "admin_receive_verify": False,
         },
     },
     "llonebot": {
@@ -36,12 +42,14 @@ ADAPTERS: dict[str, dict] = {
             "add_option": "set_group_add_option",
             "search_option": None,
             "group_info": "get_group_info",
+            "admin": "set_group_admin",
         },
         "declared": {
             "notice": True,
             "portrait": True,
             "add_option": True,
             "search_option": False,
+            "admin": True,
         },
     },
     "lagrange": {
@@ -54,13 +62,32 @@ ADAPTERS: dict[str, dict] = {
             "add_option": None,
             "search_option": None,
             "group_info": "get_group_info",
+            "admin": "set_group_admin",
         },
         "declared": {
             "notice": True,
             "portrait": True,
             "add_option": False,
             "search_option": False,
+            "admin": True,
         },
+    },
+}
+
+# SnowLuma 的 OneBot 兼容接口额外提供单个管理员权限和验证消息开关。
+ADAPTERS["snowluma"] = {
+    "label": "SnowLuma",
+    "auth": "bearer",
+    "actions": {
+        **ADAPTERS["napcat"]["actions"],
+        "admin_permissions_read": "get_group_admin_permissions",
+        "admin_permissions": "set_group_admin_permissions",
+        "admin_receive_verify": "set_group_admin_receive_verify",
+    },
+    "declared": {
+        **ADAPTERS["napcat"]["declared"],
+        "admin_permissions": True,
+        "admin_receive_verify": True,
     },
 }
 

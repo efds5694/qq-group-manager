@@ -1,0 +1,53 @@
+/* 所有组件共享语义颜色；data-theme 在首屏绘制前恢复。 */
+:root {
+  color-scheme: light;
+  --bg: #f3f5f8; --surface: #fff; --surface-2: #f1f4f8;
+  --sidebar: #f8fafc; --sidebar-2: #eef2f7; --sidebar-line: #dce3ec;
+  --text: #202b3b; --muted: #52627a; --faint: #64748b;
+  --line: #dce3ec; --line-strong: #becbdb;
+  --primary: #365f9d; --primary-dark: #244b87; --primary-soft: #eaf1fc;
+  --primary-line: #bdd0ec; --primary-text: #28538f; --primary-hover: #1b4077;
+  --accent-solid: #365f9d; --accent-border: #2d538d; --accent-hover: #2b4f85; --on-accent: #fff;
+  --brand-bg: #e2ebfa; --brand-text: #365f9d;
+  --button-bg: #f7f9fc; --button-hover: #eaf0f7; --input-bg: #fff; --placeholder: #718097;
+  --hover: #edf2f8; --selected: #e5edfa; --table-head: #eef2f7; --grouped-bg: #e9eff7;
+  --subtle-bg: #f8fafc; --panel-bg: #fff; --panel-head: #f4f7fb;
+  --focus: #537bb7; --focus-soft: #537bb724; --overlay: #24334e55;
+  --ok: #226347; --ok-soft: #eaf5ef; --ok-line: #b8d9c8;
+  --danger: #9b3546; --danger-soft: #fbeef0; --danger-line: #e5bac3;
+  --warn: #815d15; --warn-soft: #fff5df; --warn-line: #e5cf9c;
+  --teal: #22696c; --teal-soft: #e8f4f3; --teal-line: #b7d8d7;
+  --progress-bg: #dfe7f2; --scrollbar: #b4c0d0; --scrollbar-hover: #8b9bb1;
+  --radius-sm: 5px; --radius: 8px; --radius-lg: 10px;
+  --shadow-sm: none; --shadow: none; --shadow-lg: 0 16px 50px #263b5d26;
+  --mono: "Cascadia Mono", Consolas, "Courier New", monospace;
+  --sans: "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #090c10; --surface: #11161d; --surface-2: #19212b;
+  --sidebar: #0d1117; --sidebar-2: #18202b; --sidebar-line: #344154;
+  --text: #edf2f8; --muted: #bcc7d7; --faint: #9caec5;
+  --line: #303b4b; --line-strong: #475971;
+  --primary: #839bcf; --primary-dark: #acbde3; --primary-soft: #263248;
+  --primary-line: #3a4c6c; --primary-text: #c5d8f6; --primary-hover: #e2edff;
+  --accent-solid: #435a88; --accent-border: #526b9e; --accent-hover: #506b9b; --on-accent: #eef2fc;
+  --brand-bg: #34445f; --brand-text: #c6d3eb;
+  --button-bg: #252d39; --button-hover: #303b4b; --input-bg: #10161f; --placeholder: #9aaac1;
+  --hover: #253044; --selected: #21344e; --table-head: #182333; --grouped-bg: #1e2e44;
+  --subtle-bg: #101720; --panel-bg: #141c27; --panel-head: #141e2c;
+  --focus: #9baed5; --focus-soft: #7798d41c; --overlay: #06090fa8;
+  --ok: #b2e6c9; --ok-soft: #203c30; --ok-line: #3e6c54;
+  --danger: #ffc3cb; --danger-soft: #462b32; --danger-line: #7b4754;
+  --warn: #ffe0a0; --warn-soft: #45391f; --warn-line: #79633b;
+  --teal: #a2c5c4; --teal-soft: #24383c; --teal-line: #3b5258;
+  --progress-bg: #121e2d; --scrollbar: #475971; --scrollbar-hover: #6c7f99;
+  --shadow-lg: 0 16px 50px #0005;
+}
+/* 同时提供两组群颜色，切换主题无需重建列表。 */
+.group-tag, .matrix-record {
+  --tag-bg: var(--group-light-bg); --tag-text: var(--group-light-text); --tag-line: var(--group-light-line);
+}
+[data-theme="dark"] :is(.group-tag, .matrix-record) {
+  --tag-bg: var(--group-dark-bg); --tag-text: var(--group-dark-text); --tag-line: var(--group-dark-line);
+}

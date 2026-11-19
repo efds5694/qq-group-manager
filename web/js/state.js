@@ -1,4 +1,5 @@
 // 全局状态：只存跨视图共享的数据，视图内部状态各自管理
+import { assignGroupColors } from './group-colors.js';
 
 const STORAGE_KEY = 'qqgm.prefs.v1';
 
@@ -48,6 +49,8 @@ export function setSession(session) {
 
 export function setGroups(groups) {
   state.groups = groups || [];
+  const colorKey = `group-colors.${state.session?.login?.user_id || 'local'}`;
+  savePrefs({ [colorKey]:assignGroupColors(state.groups.map(group => group.group_id), loadPrefs()[colorKey]) });
   emit();
 }
 

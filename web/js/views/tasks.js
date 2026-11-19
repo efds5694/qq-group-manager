@@ -4,14 +4,16 @@ import * as api from '../api.js';
 import { state } from '../state.js';
 import { navigate } from '../router.js';
 import {
-  toast, esc, openDrawer, closeDrawer, confirmAction, statusTag, fmtDuration, fmtNumber, emptyState,
+  toast, esc, openDrawer, closeDrawer, confirmAction, statusTag, fmtDuration, fmtNumber, emptyState, bindTabs,
 } from '../ui.js';
 
-const KIND_LABEL = { card: '改群昵称', settings: '群设置', rollback: '群昵称回滚', collect: '资料补全' };
+let reload;
+
+const KIND_LABEL = { load: '资料读取', card: '改群昵称', settings: '群设置', rollback: '群昵称回滚', collect: '资料补全', member_action: '成员操作' };
 
 function jobCard(job) {
   const total = job.total || 1;
-  const done = job.ok + job.fail;
+  const done = job.cursor ?? job.ok + job.fail;
   return `
     <div class="job-item">
       <div class="job-top">
@@ -26,7 +28,7 @@ function jobCard(job) {
         <div class="bar-idle"></div>
       </div>
       <div class="progress-meta">
-        <span class="mono tiny">${done}/${job.total} · 成功 ${job.ok} · 失败 ${job.fail}</span>
+        <span class="mono tiny">${job.kind === 'load' ? `${esc(job.phase || '准备读取')} · ${job.total ? `${done}/${job.total}` : '读取中'}` : `${done}/${job.total} · 成功 ${job.ok} · 失败 ${job.fail}${job.skipped ? ' · 跳过 ' + job.skipped : ''}`}</span>
         <span class="row" style="gap:6px">
           <span class="tiny faint">${esc(job.created_text || '')}</span>
           <button class="btn btn-sm" data-job="${esc(job.id)}" type="button">详情</button>
@@ -35,20 +37,16 @@ function jobCard(job) {
     </div>`;
 }
 
-async function showJob(jobId) {
-  try {
-    const job = await api.get(`/api/jobs/${jobId}`);
-    const items = job.items || [];
-    openDrawer({
-      title: `任务详情 · ${job.title}`,
-      body: `
-        <div class="grid grid-4">
+function jobDetails(job) {
+  const items = job.items || [];
+  return `
+        <p class="tiny muted">${esc(job.phase || job.title)} · ${['pending','running'].includes(job.status) ? '每秒刷新执行进度' : '任务已结束'}</p><div class="grid grid-4">
           <div class="stat"><span class="label">总数</span><span class="value">${job.total}</span></div>
           <div class="stat"><span class="label">成功</span><span class="value ok">${job.ok}</span></div>
           <div class="stat"><span class="label">失败</span><span class="value danger">${job.fail}</span></div>
           <div class="stat"><span class="label">状态</span><span class="value" style="font-size:14px">${statusTag(job.status)}</span></div>
         </div>
-        ${job.meta?.snapshot_id ? `<div class="hint-box"><span class="hint-icon">i</span><div>本次操作快照：<span class="mono">${esc(job.meta.snapshot_id)}</span>，可在下方快照列表回滚。</div></div>` : ''}
+        ${job.meta?.snapshot_id ? `<div class="hint-box"><span class="hint-icon">i</span><div>本次操作快照：<span class="mono">${esc(job.meta.snapshot_id)}</span>${job.kind === 'settings' ? '，仅供核对，不支持自动回滚。' : '，可在下方快照列表回滚。'}</div></div>` : ''}
         ${job.meta?.snapshot_ids?.length ? `<div class="hint-box"><span class="hint-icon">i</span><div>本次操作按目标群保存了 ${job.meta.snapshot_ids.length} 份快照，可在快照列表分别回滚：<br>${job.meta.snapshot_ids.map(id => `<span class="mono">${esc(id)}</span>`).join('<br>')}</div></div>` : ''}
         ${
           items.length
@@ -65,7 +63,7 @@ async function showJob(jobId) {
                           <span class="primary-name">${esc(item.label || item.target)}</span>
                           <span class="secondary-name mono">${esc(item.action)}</span>
                         </div></td>
-                        <td>${item.ok ? '<span class="tag tag-ok">成功</span>' : `<span class="tag tag-danger">失败</span> <span class="tiny muted">${esc(item.message)}</span>`}</td>
+                        <td>${item.ok ? '<span class="tag tag-ok">成功</span>' : `<span class="tag ${item.skipped ? '' : 'tag-danger'}">${item.skipped ? '跳过' : '失败'}</span> <span class="tiny muted">${esc(item.message)}</span>`}</td>
                         <td class="mono num">${item.ms} ms</td>
                       </tr>`
                       )
@@ -74,11 +72,31 @@ async function showJob(jobId) {
                 </table>
               </div>`
             : '<p class="small faint">还没有逐条结果。</p>'
-        }`,
+        }`;
+}
+
+async function showJob(jobId) {
+  try {
+    const job = await api.get(`/api/jobs/${jobId}`);
+    openDrawer({
+      title: `任务详情 · ${job.title}`,
+      body: `<div class="job-live-details">${jobDetails(job)}</div>`,
       footer: `
-        ${job.status === 'running' ? '<button class="btn btn-danger" id="drawer-cancel" type="button">中止任务</button>' : ''}
+        ${['pending','running'].includes(job.status) ? '<button class="btn btn-danger" id="drawer-cancel" type="button">中止任务</button>' : ''}
         <button class="btn" data-close="1" type="button">关闭</button>`,
       onMount: (body, foot) => {
+        const live = body.querySelector('.job-live-details');
+        const active = () => live.isConnected && live.closest('.drawer')?.getAttribute('aria-hidden') === 'false';
+        if (['pending','running'].includes(job.status)) api.pollJob(jobId, current => {
+          const scroll = live.querySelector('.table-wrap')?.scrollTop || 0;
+          const signature = `${current.cursor}:${current.status}:${current.phase}:${current.total}`;
+          if (live.dataset.version === signature) return;
+          live.dataset.version = signature;
+          live.innerHTML = jobDetails(current);
+          if (live.querySelector('.table-wrap')) live.querySelector('.table-wrap').scrollTop = scroll;
+          const cancel = foot.querySelector('#drawer-cancel');
+          if (cancel) cancel.hidden = !['pending','running'].includes(current.status);
+        }, 1000, active).catch(error => { if (active()) toast(error.message, 'err'); });
         foot.querySelector('#drawer-cancel')?.addEventListener('click', async () => {
           try {
             await api.post(`/api/jobs/${jobId}/cancel`, {});
@@ -96,51 +114,26 @@ async function showJob(jobId) {
 }
 
 export async function render(root) {
-  root.innerHTML = `
-    <div class="page">
-      <div class="page-head">
-        <div>
-          <h1>任务中心</h1>
-          <p>执行进度、逐条结果与快照回滚。任务记录保存在内存里，重启服务后清空。</p>
-        </div>
-        <div class="page-actions">
-          <button class="btn" id="btn-refresh-all" type="button">刷新</button>
-        </div>
-      </div>
-
-      <div class="split" style="grid-template-columns:minmax(0,1.15fr) minmax(0,1fr)">
-        <div style="display:flex;flex-direction:column;gap:14px">
-          <div class="card">
-            <div class="card-head"><h3>任务</h3><span class="sub" id="job-count">—</span></div>
-            <div class="card-body" id="job-list" style="display:flex;flex-direction:column;gap:10px">
-              <div class="skeleton" style="height:80px"></div>
-            </div>
-          </div>
-
-          <div class="card">
-            <div class="card-head"><h3>快照</h3><span class="sub">改群昵称前的原始群昵称</span></div>
-            <div class="card-body" id="snapshot-list" style="display:flex;flex-direction:column;gap:8px">
-              <div class="skeleton" style="height:60px"></div>
-            </div>
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="card-head"><h3>审计日志</h3><span class="sub">最近 200 条</span></div>
-          <div class="card-body tight" id="log-list">
-            <div class="skeleton" style="height:200px"></div>
-          </div>
-        </div>
-      </div>
-    </div>`;
+  const tabs = [['jobs', '执行记录'], ['snapshots', '快照'], ['logs', '审计日志']];
+  root.innerHTML = `<div class="page tasks-page"><div class="page-head"><h1 tabindex="0" title="执行进度每秒刷新，重启后清空任务记录。">任务中心</h1><button class="btn" data-refresh-view>刷新</button></div>
+    <div class="section-tabs" role="tablist" aria-label="任务分类">${tabs.map(([id, label]) => `<button role="tab" id="task-tab-${id}" aria-controls="task-panel-${id}" data-panel-tab="${id}">${label}</button>`).join('')}</div>
+    <section class="card" role="tabpanel" id="task-panel-jobs" aria-labelledby="task-tab-jobs" data-tab-panel="jobs"><div class="card-head"><h3>执行记录</h3><span class="sub" id="job-count">—</span></div><div class="card-body task-record-list" id="job-list"><div class="skeleton" style="height:80px"></div></div></section>
+    <section class="card" role="tabpanel" id="task-panel-snapshots" aria-labelledby="task-tab-snapshots" data-tab-panel="snapshots" hidden><div class="card-head"><h3>快照</h3><span class="sub">改群昵称前保存的原始资料</span></div><div class="card-body task-record-list" id="snapshot-list"><div class="skeleton" style="height:60px"></div></div></section>
+    <section class="card" role="tabpanel" id="task-panel-logs" aria-labelledby="task-tab-logs" data-tab-panel="logs" hidden><div class="card-head"><h3>审计日志</h3><span class="sub">最近 200 条</span></div><div class="card-body tight" id="log-list"><div class="skeleton" style="height:200px"></div></div></section></div>`;
+  bindTabs(root, 'jobs');
 
   const jobList = root.querySelector('#job-list');
   const snapList = root.querySelector('#snapshot-list');
   const logList = root.querySelector('#log-list');
 
+  let jobsTimer, jobsPending = false;
   const loadJobs = async () => {
+    if (!jobList.isConnected || jobsPending) return;
+    clearTimeout(jobsTimer); jobsPending = true;
+    const started = Date.now();
     try {
       const data = await api.get('/api/jobs');
+      if (!jobList.isConnected) return;
       root.querySelector('#job-count').textContent = `${data.jobs.length} 个`;
       jobList.innerHTML = data.jobs.length
         ? data.jobs.map(jobCard).join('')
@@ -150,6 +143,9 @@ export async function render(root) {
       });
     } catch (error) {
       jobList.innerHTML = `<div class="hint-box danger"><span class="hint-icon">!</span><div>${esc(error.message)}</div></div>`;
+    } finally {
+      jobsPending = false;
+      if (jobList.isConnected) jobsTimer = setTimeout(loadJobs, Math.max(0, 1000 - (Date.now() - started)));
     }
   };
 
@@ -240,14 +236,8 @@ export async function render(root) {
     }
   };
 
-  root.querySelector('#btn-refresh-all').addEventListener('click', async () => {
-    await Promise.all([loadJobs(), loadSnapshots(), loadLogs()]);
-    toast('已刷新', 'ok');
-  });
-
-  await Promise.all([loadJobs(), loadSnapshots(), loadLogs()]);
+  reload = () => Promise.all([loadJobs(), loadSnapshots(), loadLogs()]);
+  await reload();
 }
 
-export async function refresh() {
-  await render(document.getElementById('view'));
-}
+export async function refresh() { await reload?.(); }

@@ -1,6 +1,6 @@
 // 共享条件编辑器；群目录、成员工作台和群选择器均使用此组件。
 import * as api from './api.js';
-import { esc, toast } from './ui.js';
+import { esc, toast, menuChevron } from './ui.js';
 
 export const emptyRule = () => ({ op: 'and', rules: [] });
 export let catalog = { fields: [], operators: {}, presets: [], group_presets: [] };
@@ -42,6 +42,12 @@ export function summary(rule) {
   return `${label} ${catalog.operators[rule.op] || rule.op} ${['empty', 'missing', 'exists'].includes(rule.op) ? '' : value}`.trim();
 }
 
+export function conditionCount(rule) {
+  if (Array.isArray(rule?.rules)) return rule.rules.reduce((total, child) => total + conditionCount(child), 0);
+  if (rule?.relation) return Math.max(1, conditionCount(rule.where));
+  return rule?.field ? 1 : 0;
+}
+
 function fieldOptions(current) {
   const categories = [['群聊资料', 'group.'], ['成员资料', 'member.'], ['跨群计算', 'person.']];
   return categories.map(([label, prefix]) => `<optgroup label="${label}">${catalog.fields.filter(field => field.id.startsWith(prefix) && !field.id.includes('.raw.')).map(field => `<option value="${esc(field.id)}" ${field.id === current ? 'selected' : ''}>${esc(field.label)}</option>`).join('')}</optgroup>`).join('') +
@@ -80,14 +86,16 @@ function renderRule(rule, path = '') {
 }
 
 export class FilterBar {
-  constructor(element, { rule, onApply, compact = false, entity = 'memberships', context = 'all' } = {}) {
+  constructor(element, { rule, onApply, compact = false, menu = false, entity = 'memberships', context = 'all', label = '筛选' } = {}) {
     this.element = element;
     this.rule = clone(rule || emptyRule());
     this.draft = clone(this.rule);
     this.onApply = onApply;
     this.compact = compact;
+    this.menu = menu;
     this.entity = entity;
     this.context = context;
+    this.label = label;
     this.selectedPreset = '';
     this.temporary = false;
     this.paint();
@@ -113,15 +121,19 @@ export class FilterBar {
   }
 
   paint() {
-    this.element.innerHTML = `<div class="filter-bar"><select class="input filter-presets" aria-label="共享筛选预设">${this.options()}</select><button class="btn filter-toggle" type="button">编辑条件</button>${regexHelpLink()}
+    const content = `<div class="filter-bar"><select class="input filter-presets" aria-label="共享筛选预设">${this.options()}</select><button class="btn filter-toggle" type="button" aria-expanded="false">高级条件</button>
       <span class="filter-summary" title="${esc(summary(this.rule))}">${esc(summary(this.rule))}</span><button class="btn btn-text filter-clear" type="button">清除</button></div>
       <div class="filter-editor" hidden><div class="filter-rule-tree"></div><p class="tiny faint">同一关系组内的条件由同一条记录满足。正则使用 Python 语法；日期按北京时间，范围值用逗号分隔。</p>
-      <div class="filter-editor-actions"><button class="btn btn-primary filter-apply" type="button">应用条件</button><button class="btn filter-save-toggle" type="button">保存为下拉预设</button><span class="spacer"></span><button class="btn btn-text filter-delete" type="button">删除此预设</button></div>
+      <div class="filter-editor-actions">${regexHelpLink()}<button class="btn btn-primary filter-apply" type="button">应用条件</button><button class="btn filter-save-toggle" type="button">保存为下拉预设</button><span class="spacer"></span><button class="btn btn-text filter-delete" type="button">删除此预设</button></div>
       <div class="filter-save-form" hidden><input class="input" placeholder="预设名称" aria-label="预设名称"/><button class="btn filter-save-new" type="button">另存为新预设</button><button class="btn filter-save-existing" type="button">更新此预设</button></div><p class="filter-error" role="alert"></p></div>`;
+    this.element.innerHTML = this.menu
+      ? `<details class="action-menu filter-control"><summary class="btn btn-sm" title="${esc(summary(this.rule))}"><span class="filter-trigger-label"></span>${menuChevron}</summary><div class="action-menu-panel" data-menu-keep>${content}</div></details>`
+      : content;
+    this.paintMenu();
     this.tree = this.element.querySelector('.filter-rule-tree');
     this.editor = this.element.querySelector('.filter-editor');
     this.paintTree();
-    this.element.querySelector('.filter-toggle').addEventListener('click', () => { this.editor.hidden = !this.editor.hidden; });
+    this.element.querySelector('.filter-toggle').addEventListener('click', () => { this.editor.hidden = !this.editor.hidden; this.element.querySelector('.filter-toggle').setAttribute('aria-expanded', String(!this.editor.hidden)); });
     const select = this.element.querySelector('.filter-presets');
     select.addEventListener('presetsupdated', () => { select.innerHTML = this.options(); });
     select.addEventListener('change', () => {
@@ -131,7 +143,7 @@ export class FilterBar {
       if (!preset) return;
       this.draft = clone(preset.rule);
       this.paintTree();
-      if (preset.parameterized) this.editor.hidden = false;
+      if (preset.parameterized) { this.editor.hidden = false; this.element.querySelector('.filter-toggle').setAttribute('aria-expanded', 'true'); }
       else this.apply();
     });
     this.element.querySelector('.filter-clear').addEventListener('click', () => {
@@ -211,11 +223,22 @@ export class FilterBar {
 
   error(message = '') { this.element.querySelector('.filter-error').textContent = message; }
 
+  paintMenu() {
+    if (!this.menu) return;
+    const count = conditionCount(this.rule);
+    const trigger = this.element.querySelector('.filter-trigger-label');
+    trigger.textContent = count ? `${this.label} · ${count}` : this.label;
+    trigger.closest('summary').title = summary(this.rule);
+    trigger.closest('summary').classList.toggle('filter-active', Boolean(count));
+  }
+
   apply() {
     this.rule = clone(this.draft);
     this.error();
     const node = this.element.querySelector('.filter-summary');
     node.textContent = summary(this.rule); node.title = node.textContent;
+    this.paintMenu();
+    if (this.menu) this.element.querySelector('.filter-control').open = false;
     this.onApply?.(clone(this.rule));
   }
 

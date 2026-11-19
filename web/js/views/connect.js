@@ -32,7 +32,7 @@ function capabilityChips(caps) {
     .join('');
 }
 
-export async function render(root) {
+export async function render(root, { embedded = false } = {}) {
   const config = await api.get('/api/config');
   state.config = config;
   const active = config.active || {};
@@ -130,6 +130,13 @@ export async function render(root) {
         </div>
       </div>
     </div>`;
+
+  if (embedded) {
+    const heading = root.querySelector('.page-head');
+    heading.replaceChildren(root.querySelector('#btn-guide'));
+    heading.className = 'connection-help';
+    root.querySelector('.page').className = 'connection-panel';
+  }
 
   const urlInput = root.querySelector('#f-url');
   const nameInput = root.querySelector('#f-name');

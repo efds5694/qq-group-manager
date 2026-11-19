@@ -1,14 +1,27 @@
 import { Virtualizer, observeElementRect, observeElementOffset, elementScroll } from '../vendor/tanstack-virtual-core/index.js';
 import * as api from './api.js';
-import { esc, fmtNumber } from './ui.js';
+import { esc, highlightText, fmtNumber, dataTimeLabel } from './ui.js';
 import { ResultWindows } from './result-windows.js';
 import { state, loadPrefs, savePrefs } from './state.js';
 import { canResize, columnWidth, restoreColumns, columnGroups, sortState } from './column-layout.js';
-import { groupTag, groupTone, fieldStatusTag, renderField } from './field-display.js';
+import { groupLink, groupTray, paintGroupTrays, groupTone, groupColorStyle, fieldStatusTag, renderField } from './field-display.js';
 
 const HEADER = 44;
+
+export async function readResultIds(data) {
+  if (data.selection_ids) return data.selection_ids;
+  const records = data.items.filter(row => row.kind !== 'group');
+  return records.length === data.total ? records.map(row => row.id)
+    : (await api.get(`/api/query/results/${data.query_id}/selection`)).ids;
+}
+
+export function retainSelection(selected, ids) {
+  const matching = new Set(ids);
+  for (const id of selected) if (!matching.has(id)) selected.delete(id);
+}
+
 export class ResultTable {
-  constructor(element, { columns = [], selected, onSelection, onDetail, onSort, sort, onReload, onRowDoubleClick, layoutKey, rowHeight = 56 } = {}) {
+  constructor(element, { columns = [], selected, onSelection, onDetail, onSort, sort, onReload, onRowDoubleClick, layoutKey, rowHeight = 48 } = {}) {
     this.element = element;
     this.options = { selected, onSelection, onDetail, onSort, sort, onReload, onRowDoubleClick, rowHeight };
     this.widthKey = `table-columns.${state.session?.login?.user_id || 'local'}.${layoutKey || element.id || 'result'}`;
@@ -34,12 +47,13 @@ export class ResultTable {
     this.vertical._willUpdate(); this.horizontal._willUpdate();
     this.viewport.addEventListener('change', event => {
       const check = event.target;
-      if (check.matches('[data-check-visible]')) {
-        this.visibleRows().forEach(row => { if (check.checked) selected.add(row.id); else selected.delete(row.id); });
+      if (this.loading || this.selectionBusy) return;
+      if (check.matches('[data-check-all]')) {
+        this.selectAll(check.checked); return;
       } else if (check.matches('[data-row-check]')) {
         if (check.checked) selected.add(check.dataset.rowCheck); else selected.delete(check.dataset.rowCheck);
       } else return;
-      onSelection?.(); this.schedule();
+      onSelection?.({id: check.dataset.rowCheck, checked: check.checked}); this.schedule();
     });
     this.viewport.addEventListener('click', event => {
       if (event.target.closest('[data-column-resize]') || this.resizeState) return;
@@ -88,6 +102,7 @@ export class ResultTable {
     this.status.addEventListener('click', event => {
       if (event.target.closest('[data-result-reload]')) onReload?.();
       if (event.target.closest('[data-result-retry]')) { this.cache.errors.clear(); this.schedule(); }
+      if (event.target.closest('[data-selection-retry]')) this.selectAll(this.selectionIntent);
     });
     // DOM 被替换或抽屉关闭时释放观察器，避免隐藏列表继续请求。
     this.observer = new MutationObserver(() => {
@@ -98,12 +113,68 @@ export class ResultTable {
 
   setData(data, columns = this.columns) {
     this.data = data; this.columns = restoreColumns(columns, this.widths);
+    this.selectionIds = data.selection_ids || null; this.selectionPromise = null; this.selectionError = null;
+    this.selectionBusy = false; this.loading = false;
+    const records = data.items.filter(row => row.kind !== 'group');
+    if (records.length === data.total) this.selectionIds = records.map(row => row.id);
     this.cache = new ResultWindows(data, (id, offset, limit) => api.get(`/api/query/results/${id}`, { offset, limit }));
     this.viewport.scrollTop = 0;
     this.vertical.setOptions({ ...this.vertical.options, count: data.total_rows });
     this.reflowColumns();
     this.vertical.measure();
-    this.schedule();
+    // 首批结果到达后直接渲染，浏览器暂停动画帧时也能生成表格内容。
+    if (this.frame) cancelAnimationFrame(this.frame);
+    this.frame = null;
+    this.paint();
+    if (this.options.selected?.size && !this.selectionIds) this.loadSelectionIds().catch(error => {
+      if (!this.disposed && this.data === data) { this.selectionIntent = true; this.selectionError = error; this.schedule(); }
+    });
+  }
+
+  setLoading(value) { this.loading = value; this.schedule(); }
+
+  async loadSelectionIds() {
+    if (this.selectionIds) return this.selectionIds;
+    if (this.selectionPromise) return this.selectionPromise;
+    const data = this.data;
+    const pending = readResultIds(data).then(ids => {
+      if (this.data === data) this.selectionIds = ids;
+      this.schedule();
+      return ids;
+    }).finally(() => { if (this.selectionPromise === pending) this.selectionPromise = null; });
+    this.selectionPromise = pending;
+    return pending;
+  }
+
+  async selectAll(checked) {
+    if (this.disposed || this.loading || this.selectionBusy) return;
+    const data = this.data;
+    this.selectionBusy = true; this.selectionIntent = checked; this.selectionError = null;
+    this.options.onSelection?.(); this.schedule();
+    try {
+      const ids = await this.loadSelectionIds();
+      if (this.disposed || this.loading || this.data !== data) return;
+      ids.forEach(id => { if (checked) this.options.selected.add(id); else this.options.selected.delete(id); });
+    } catch (error) {
+      if (this.data === data) {
+        this.selectionError = error;
+        if (error.code === 'QUERY_EXPIRED') this.cache.expired = true;
+      }
+    } finally {
+      if (this.data === data && !this.disposed) {
+        this.selectionBusy = false;
+        this.options.onSelection?.(); this.schedule();
+      }
+    }
+  }
+
+  selectionState() {
+    const selected = this.options.selected;
+    const ids = this.selectionIds;
+    const count = ids ? ids.reduce((sum, id) => sum + Number(selected?.has(id)), 0) : 0;
+    return { checked: Boolean(ids?.length && count === ids.length),
+      indeterminate: count > 0 && count < ids.length || !ids && Boolean(selected?.size),
+      disabled: !this.data.total || this.loading || this.selectionBusy || this.cache.expired };
   }
 
   reflowColumns() {
@@ -167,52 +238,56 @@ export class ResultTable {
     this.viewport.setAttribute('aria-rowcount', this.data.total_rows + 1);
     const selected = this.options.selected;
     const focused = document.activeElement?.dataset?.rowCheck;
-    const focusedHeader = document.activeElement?.matches?.('[data-check-visible]');
+    const focusedHeader = document.activeElement?.matches?.('[data-check-all]');
     const focusedResize = document.activeElement?.dataset?.columnResize;
     let pinnedLeft = 0;
     const cols = this.pinned.map(col => { const item = { ...col, left: pinnedLeft }; pinnedLeft += col.width; return item; })
       .concat(this.horizontal.getVirtualItems().map(item => ({ ...this.rest[item.index], left: item.start })));
     const cellStyle = col => `width:${col.width}px;left:${col.left}px`;
-    this.head.innerHTML = cols.map(col => {
+    const header = cols.map(col => {
       const sorted = sortState(col.key, this.options.sort);
       const heading = col.header ? col.header() : `<span class="result-heading-label">${esc(col.label)}</span>`;
       const arrow = sorted.active ? `<span class="result-sort-arrow" aria-hidden="true">${sorted.arrow}</span>` : '';
       const resize = canResize(col) ? `<span class="result-resize-handle" data-column-resize="${esc(col.key)}" tabindex="0" role="separator" aria-orientation="vertical" aria-label="调整${esc(col.label)}列宽" aria-valuemin="${col.minWidth || 90}" aria-valuemax="${col.maxWidth || 1000}" aria-valuenow="${col.width}" title="拖动调整列宽；双击恢复默认；方向键微调"></span>` : '';
       return `<div class="result-cell ${col.pinned ? 'result-pinned' : ''} ${sorted.active ? 'result-sorted' : ''} ${canResize(col) ? 'result-resizable' : ''}" style="${cellStyle(col)}" role="columnheader"${this.options.sort ? ` aria-sort="${sorted.aria}"` : ''}>${col.key === '__check'
-      ? '<label class="checkbox" title="勾选当前可见记录"><input type="checkbox" data-check-visible aria-label="勾选当前可见记录"/><span></span></label>'
+      ? '<label class="checkbox" title="全选当前筛选的全部记录，包含未显示的记录"><input type="checkbox" data-check-all aria-label="全选当前筛选的全部记录"/><span></span></label>'
       : this.options.onSort && col.sort !== false ? `<button class="result-sort" data-result-sort="${esc(col.key)}" title="按${esc(col.label)}排序${sorted.active ? `：当前${sorted.label}` : ''}">${heading}${arrow}</button>` : `${heading}${arrow}`}${resize}</div>`;
     }).join('');
+    const headerChanged = this.headerMarkup !== header;
+    if (headerChanged) {
+      this.head.innerHTML = header;
+      this.headerMarkup = header;
+    }
     this.body.innerHTML = rows.map(item => {
       const row = this.cache.get(item.index);
       if (!row) return `<div class="result-row result-placeholder" style="top:${item.start}px;height:${item.size}px" role="row"><span>正在读取第 ${fmtNumber(item.index + 1)} 条…</span></div>`;
       if (row.kind === 'group') return `<div class="result-row result-bucket" style="top:${item.start}px;height:${item.size}px" role="row"><strong>${esc(row.label)}</strong><span>${fmtNumber(row.count)} 条</span></div>`;
       return `<div class="result-row ${selected?.has(row.id) ? 'selected' : ''}" data-record-id="${esc(row.id)}"${this.options.onRowDoubleClick ? ' title="双击查看本群成员"' : ''} style="top:${item.start}px;height:${item.size}px" role="row" aria-rowindex="${item.index+2}">
         ${cols.map(col => `<div class="result-cell ${col.pinned ? 'result-pinned' : ''}" style="${cellStyle(col)}" role="cell">${col.key === '__check'
-          ? `<label class="checkbox"><input type="checkbox" data-row-check="${esc(row.id)}" ${selected.has(row.id) ? 'checked' : ''} aria-label="勾选 ${esc(row.id)}"/><span></span></label>`
+          ? `<label class="checkbox"><input type="checkbox" data-row-check="${esc(row.id)}" ${selected.has(row.id) ? 'checked' : ''} ${this.loading || this.selectionBusy ? 'disabled' : ''} aria-label="勾选 ${esc(row.id)}"/><span></span></label>`
           : col.render ? col.render(row) : `<span title="${esc(row.display?.[col.key])}">${esc(row.display?.[col.key] || '—')}</span>`}</div>`).join('')}</div>`;
     }).join('');
+    paintGroupTrays(this.body);
     const visible = this.visibleRows();
-    const checkbox = this.head.querySelector('[data-check-visible]');
+    const checkbox = this.head.querySelector('[data-check-all]');
     if (checkbox) {
-      const count = visible.filter(row => selected.has(row.id)).length;
-      checkbox.checked = visible.length > 0 && count === visible.length;
-      checkbox.indeterminate = count > 0 && count < visible.length;
-      checkbox.disabled = !visible.length;
+      Object.assign(checkbox, this.selectionState());
     }
     if (focused) [...this.body.querySelectorAll('[data-row-check]')].find(input => input.dataset.rowCheck === focused)?.focus({ preventScroll: true });
-    if (focusedHeader) checkbox?.focus({ preventScroll: true });
-    if (focusedResize) [...this.head.querySelectorAll('[data-column-resize]')].find(handle => handle.dataset.columnResize === focusedResize)?.focus({ preventScroll:true });
-    if (this.cache.expired) this.status.innerHTML = '查询结果已失效，已加载内容和勾选保留。<button class="btn btn-sm" data-result-reload>重新加载</button>';
+    if (headerChanged && focusedHeader) checkbox?.focus({ preventScroll: true });
+    if (headerChanged && focusedResize) [...this.head.querySelectorAll('[data-column-resize]')].find(handle => handle.dataset.columnResize === focusedResize)?.focus({ preventScroll:true });
+    if (this.selectionBusy) this.status.textContent = '正在取得全部筛选记录的勾选范围…';
+    else if (this.cache.expired) this.status.innerHTML = '查询结果已失效，已加载内容和勾选保留。<button class="btn btn-sm" data-result-reload>重新加载</button>';
+    else if (this.selectionError) this.status.innerHTML = `${esc(this.selectionError.message)} <button class="btn btn-sm" data-selection-retry>重试全选</button>`;
     else if (this.cache.errors.size) this.status.innerHTML = `${esc([...this.cache.errors.values()][0].message)} <button class="btn btn-sm" data-result-retry>重试当前窗口</button>`;
     else {
-      const timestamp = this.data.data_at || this.data.created_at;
-      const at = timestamp ? ` · ${this.data.data_at ? '名单最早时间' : '查询生成'} ${new Date(timestamp*1000).toLocaleString('zh-CN')}${this.data.stale ? ' · 旧缓存，可刷新' : ''}` : '';
       const sort = this.options.sort;
       const label = sort && this.data.fields?.find(field => field.id === sort.field)?.label;
       const order = sort ? ` · ${Object.keys(this.data.buckets || {}).length ? '分组内' : ''}按${label || sort.field}${sort.desc ? '降序' : '升序'}` : '';
-      this.status.textContent = (!this.data.total_rows ? '没有匹配记录，可调整范围或条件。' : visible.length
-        ? `当前第 ${fmtNumber(visible[0].position)}–${fmtNumber(visible.at(-1).position)} 条／共 ${fmtNumber(this.data.total)} 条${at}`
-        : `正在读取当前位置／共 ${fmtNumber(this.data.total)} 条${at}`) + order;
+      const range = (!this.data.total_rows ? '没有匹配记录，可调整范围或条件。' : visible.length
+        ? `当前第 ${fmtNumber(visible[0].position)}–${fmtNumber(visible.at(-1).position)} 条／共 ${fmtNumber(this.data.total)} 条`
+        : `正在读取当前位置／共 ${fmtNumber(this.data.total)} 条`) + order;
+      this.status.innerHTML = `<span>${esc(range)}</span>${this.data.query_id || this.data.data_at ? `<span class="result-data-time">${esc(dataTimeLabel(this.data))}</span>` : ''}`;
     }
     const cache = this.cache;
     const needed = new Set(rows.filter(item => !cache.get(item.index)).map(item => item.index));
@@ -232,7 +307,7 @@ export class ResultTable {
   }
 }
 
-export function dataColumns(data, { selected, matrix = false, matrixField = 'member.card', detail = true, overview = false } = {}) {
+export function dataColumns(data, { selected, matrix = false, matrixField = 'member.card', detail = true, overview = false, navigateGroups = false, search = '' } = {}) {
   const definitions = new Map(data.fields.map(field => [field.id, field]));
   const groups = new Map(data.groups.map(group => [group.group_id,group.name]));
   const keys = matrix ? ['member.qq', 'member.nickname'] : data.columns;
@@ -240,13 +315,16 @@ export function dataColumns(data, { selected, matrix = false, matrixField = 'mem
   keys.forEach((key, index) => cols.push({ key, label: definitions.get(key)?.label || key, pinned: index < 2,
     width: key.endsWith('.qq') || key.endsWith('.group_id') ? 130 : index === 0 && key.startsWith('group.') ? 260
       : key === 'person.group_names' ? 420 : key.endsWith('_time') ? 205 : key.endsWith('.nickname') ? 180 : 200,
-    render: key === 'person.group_names' ? row => `<button class="result-link group-chip-list" data-result-open="${esc(row.id)}" title="${esc(row.display[key])}">${(row.memberships || []).slice(0,2).map((member,index)=>groupTag(groups.get(member.group_id) || row.values[key]?.[index] || member.group_id,member.group_id)).join('')}${(row.memberships?.length || 0)>2 ? `<span class="field-tag field-state-neutral">+${row.memberships.length-2}</span>` : ''}</button>`
+    render: key === 'person.group_names' ? row => groupTray((row.memberships || []).map((member, index) =>
+      [member.group_id, groups.get(member.group_id) || row.values[key]?.[index] || member.group_id]), search)
+      : navigateGroups && ['group.display_name','group.group_name','group.group_remark'].includes(key) ? row => row.display[key]
+        ? groupLink(row.display[key], row.group_id, search) : renderField(row,key, '—', search)
       : key === 'person.source_conflict' ? row => row.values[key] ? `<button class="result-link field-tag field-state-warning" data-result-open="${esc(row.id)}">有差异 · 查看</button>` : fieldStatusTag('无冲突','success')
-      : row => renderField(row,key) }));
-  if (matrix) data.groups.forEach(group => cols.push({ key: `matrix:${group.group_id}`, label: group.name, header:()=>groupTag(group.name,group.group_id), width: 230, sort: false,
+      : row => renderField(row,key, '—', search) }));
+  if (matrix) data.groups.forEach(group => cols.push({ key: `matrix:${group.group_id}`, label: group.name, header:()=>groupLink(group.name,group.group_id,search), width: 230, sort: false,
     render: row => {
       const membership = row.memberships.find(item => item.group_id === group.group_id);
-      return membership ? `<button class="result-link matrix-record group-tone-${groupTone(group.group_id)} ${membership.matched ? 'matched' : ''}" data-result-open="${esc(row.id)}" data-group-id="${esc(group.group_id)}"><span>${esc(membership.display[matrixField] || '（空）')}</span><small>${esc(membership.display['member.role'])}${membership.matched ? ' · 匹配' : ''}</small></button>` : fieldStatusTag('未加入','neutral');
+      return membership ? `<button class="result-link matrix-record group-tone-${groupTone(group.group_id)} ${membership.matched ? 'matched' : ''}" style="${groupColorStyle(group.group_id)}" data-result-open="${esc(row.id)}" data-group-id="${esc(group.group_id)}"><span>${highlightText(membership.display[matrixField] || '（空）', search)}</span><small>${esc(membership.display['member.role'])}${membership.matched ? ' · 匹配' : ''}</small></button>` : fieldStatusTag('未加入','neutral');
     } }));
   if (detail) cols.push({ key: '__detail', label: '', width: 85, sort: false, render: row => `<button class="btn btn-sm btn-text" data-result-open="${esc(row.id)}">${overview ? '各群资料' : '资料'}</button>` });
   return cols;

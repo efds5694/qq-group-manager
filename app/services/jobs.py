@@ -1,6 +1,6 @@
 """批量任务队列。
 
-单工作线程串行执行，天然限速；前端每 400ms 轮询进度。
+写任务由单工作线程串行执行，天然限速；前端每秒轮询进度。
 线程而不是 asyncio：标准库环境下更可控，也不会和 HTTP 服务抢事件循环。
 """
 
@@ -37,8 +37,11 @@ class JobManager:
                     self._jobs[job_id].update(status="failed", error="任务执行异常", finished_at=time.time())
             finally:
                 for gid in {str(task["params"]["group_id"]) for task in tasks
-                            if task["action"] == "set_group_card"}:
+                            if task["action"] in ("set_group_card", "set_group_admin", "set_group_kick", "set_group_ban")}:
                     members.expire(client, gid)
+                if self._jobs[job_id]["kind"] == "settings":
+                    from . import groups
+                    groups.invalidate()
                 self._queue.task_done()
 
     # ------------------------------------------------------------- 创建任务
@@ -84,8 +87,39 @@ class JobManager:
             self._jobs[job_id] = job
             self._cancel_flags[job_id] = cancel_flag
 
-        self._queue.put((job_id, client, tasks, cancel_flag))
+        if kind == "load":
+            threading.Thread(target=self._run_read, args=(job_id, tasks[0]["run"], cancel_flag),
+                             name=f"read-{job_id}", daemon=True).start()
+        else:
+            self._queue.put((job_id, client, tasks, cancel_flag))
         return self.get(job_id)
+
+    def _run_read(self, job_id, work, cancel):
+        """耗时读取在独立线程运行，复用任务查询，不阻塞串行写队列。"""
+        with self._lock:
+            job = self._jobs[job_id]
+            job.update(status="running", started_at=time.time(), total=0)
+
+        def progress(phase, current=0, total=0):
+            if cancel.is_set():
+                from ..core.errors import AppError
+                raise AppError("资料读取已中止", code="CANCELED")
+            with self._lock:
+                job.update(phase=phase, cursor=current, ok=current, total=total)
+
+        try:
+            result = work(progress)
+            with self._lock:
+                job.update(status="canceled" if cancel.is_set() else "done", result=result,
+                           finished_at=time.time())
+                if not cancel.is_set():
+                    total = job["total"] or 1
+                    job.update(phase="资料读取完成", total=total, cursor=total, ok=total)
+        except Exception as exc:
+            with self._lock:
+                job.update(status="canceled" if cancel.is_set() else "failed", finished_at=time.time(),
+                           error=getattr(exc, "message", None) or str(exc),
+                           error_code=getattr(exc, "code", "APP_ERROR"), hint=getattr(exc, "hint", ""))
 
     # ------------------------------------------------------------- 执行循环
     def _run(self, job_id: str, client, tasks: list[dict], cancel: threading.Event) -> None:
@@ -118,12 +152,16 @@ class JobManager:
 
             started = time.perf_counter()
             ok = False
+            skipped = False
             message = ""
             for attempt in range(retries + 1):
                 try:
-                    client.call(task["action"], **task["params"])
-                    ok = True
-                    message = ""
+                    reason = task["run"]() if "run" in task else None
+                    if "run" not in task:
+                        client.call(task["action"], **task["params"])
+                    skipped = bool(reason)
+                    ok = not skipped
+                    message = reason or ""
                     break
                 except Exception as exc:  # 单条失败不影响整批
                     message = getattr(exc, "message", None) or str(exc)
@@ -136,7 +174,9 @@ class JobManager:
             elapsed_ms = int((time.perf_counter() - started) * 1000)
             with self._lock:
                 job["cursor"] = index + 1
-                if ok:
+                if skipped:
+                    job["skipped"] += 1
+                elif ok:
                     job["ok"] += 1
                 else:
                     job["fail"] += 1
@@ -150,6 +190,7 @@ class JobManager:
                             "label": task.get("label", ""),
                             "action": task["action"],
                             "ok": ok,
+                            "skipped": skipped,
                             "message": message[:200],
                             "ms": elapsed_ms,
                         }
@@ -228,6 +269,9 @@ class JobManager:
                     "total": job["total"],
                     "ok": job["ok"],
                     "fail": job["fail"],
+                    "skipped": job["skipped"],
+                    "cursor": job["cursor"],
+                    "phase": job.get("phase", ""),
                     "created_at": job["created_at"],
                     "created_text": time.strftime("%H:%M:%S", time.localtime(job["created_at"])),
                 }

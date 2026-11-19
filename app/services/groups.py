@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ..core import store
 from ..core.errors import AppError, UnsupportedAction
@@ -85,7 +85,7 @@ def _self_role(client, group_id: str, self_id: str) -> str:
         return ""
 
 
-def _fetch_roles(client, group_ids: list[str], self_id: str) -> dict[str, str]:
+def _fetch_roles(client, group_ids: list[str], self_id: str, on_progress=None) -> dict[str, str]:
     if not group_ids or not self_id:
         return {}
     workers = max(1, min(MAX_WORKERS, len(group_ids)))
@@ -95,8 +95,12 @@ def _fetch_roles(client, group_ids: list[str], self_id: str) -> dict[str, str]:
         return gid, _self_role(client, gid, self_id)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        for gid, role in pool.map(one, group_ids):
+        pending = [pool.submit(one, gid) for gid in group_ids]
+        for future in as_completed(pending):
+            gid, role = future.result()
             result[gid] = role
+            if on_progress:
+                on_progress("读取各群管理身份", len(result), len(group_ids))
     return result
 
 
@@ -119,7 +123,7 @@ def _group_remark(client, group_id: str, force: bool = False) -> tuple[str | Non
     return None, True
 
 
-def _fetch_remarks(client, group_ids: list[str], meta: dict, force: bool = False) -> bool:
+def _fetch_remarks(client, group_ids: list[str], meta: dict, force: bool = False, on_progress=None) -> bool:
     """并发补群备注，返回协议端是否提供备注字段。"""
     if not group_ids:
         return True
@@ -132,7 +136,11 @@ def _fetch_remarks(client, group_ids: list[str], meta: dict, force: bool = False
         return gid, *_group_remark(client, gid, force)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        for gid, remark, ok in pool.map(one, group_ids):
+        pending = [pool.submit(one, gid) for gid in group_ids]
+        for index, future in enumerate(as_completed(pending), 1):
+            gid, remark, ok = future.result()
+            if on_progress:
+                on_progress("读取群备注", index, len(group_ids))
             if not ok:
                 supported = False
                 continue
@@ -154,7 +162,7 @@ def _apply_remarks(remarks: dict[str, str], key: tuple[str, str]) -> None:
         group["group_remark"] = remarks.get(group["group_id"], "")
 
 
-def fetch_remarks(client, self_id: str, group_ids: list[str], force: bool = False) -> tuple[dict, bool]:
+def fetch_remarks(client, self_id: str, group_ids: list[str], force: bool = False, on_progress=None) -> tuple[dict, bool]:
     """补齐群备注并返回 {群号: 备注}（只含有备注的群）。"""
     ids = [str(gid) for gid in group_ids]
     if not ids or not self_id:
@@ -166,7 +174,7 @@ def fetch_remarks(client, self_id: str, group_ids: list[str], force: bool = Fals
 
     pending = [gid for gid in ids if force or gid not in meta["remarks"]]
     if pending:
-        supported = _fetch_remarks(client, pending, meta, force)
+        supported = _fetch_remarks(client, pending, meta, force, on_progress)
         if not supported:
             with _META_LOCK:
                 meta["remarks_supported"] = False
@@ -180,7 +188,7 @@ def fetch_remarks(client, self_id: str, group_ids: list[str], force: bool = Fals
     )
 
 
-def list_groups(client, self_id: str = "", force: bool = False) -> list[dict]:
+def list_groups(client, self_id: str = "", force: bool = False, on_progress=None) -> list[dict]:
     now = time.time()
     key = (client.cache_namespace, str(self_id))
     with _LOCK:
@@ -190,9 +198,14 @@ def list_groups(client, self_id: str = "", force: bool = False) -> list[dict]:
         cached = store.read_json(store.CACHE_DIR / f"groups-{client.cache_namespace}.json")
 
     if cached and not force and now - cached["at"] < TTL:
+        if on_progress:
+            on_progress("已读取缓存群列表", len(cached["groups"]), len(cached["groups"]))
         return cached["groups"]
 
-    raw = client.call("get_group_list", timeout=20) or []
+    if on_progress:
+        on_progress("读取群列表")
+    raw = client.call("get_group_list", timeout=20, **({"no_cache": True} if force else {})) or []
+    now = time.time()
     infos = [item for item in raw if isinstance(item, dict) and item.get("group_id")]
 
     ids = [str(item.get("group_id")) for item in infos]
@@ -201,7 +214,9 @@ def list_groups(client, self_id: str = "", force: bool = False) -> list[dict]:
     missing = [gid for gid in ids if force or not roles.get(gid)]
 
     if missing and self_id:
-        roles.update(_fetch_roles(client, missing, self_id))
+        if on_progress:
+            on_progress("读取各群管理身份", 0, len(missing))
+        roles.update(_fetch_roles(client, missing, self_id, on_progress))
         roles = {gid: role for gid, role in roles.items() if gid in ids}
         with _META_LOCK:
             meta["roles"] = roles
@@ -246,6 +261,8 @@ def list_groups(client, self_id: str = "", force: bool = False) -> list[dict]:
     with _LOCK:
         _CACHE[key] = {"at": now, "groups": groups}
     store.write_json(store.CACHE_DIR / f"groups-{client.cache_namespace}.json", {"at": now, "groups": groups})
+    if on_progress:
+        on_progress("群列表已读取", len(groups), len(groups))
     return groups
 
 

@@ -53,17 +53,20 @@ export const post = (path, body) => request(path, { method: 'POST', body: body |
 export const del = (path) => request(path, { method: 'DELETE' });
 
 /** 轮询任务直到结束，onTick 每次拿到最新快照 */
-export function pollJob(jobId, onTick, intervalMs = 400) {
+export function pollJob(jobId, onTick, intervalMs = 1000, isActive = () => true) {
   return new Promise((resolve, reject) => {
     const tick = async () => {
+      if (!isActive()) { resolve(null); return; }
+      const started = Date.now();
       try {
         const job = await get(`/api/jobs/${jobId}`);
+        if (!isActive()) { resolve(null); return; }
         onTick?.(job);
         if (['done', 'failed', 'canceled'].includes(job.status)) {
           resolve(job);
           return;
         }
-        window.setTimeout(tick, intervalMs);
+        window.setTimeout(tick, Math.max(0, intervalMs - (Date.now() - started)));
       } catch (error) {
         reject(error);
       }

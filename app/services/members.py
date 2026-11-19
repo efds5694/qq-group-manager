@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ..core import store
 from ..core.errors import AppError
@@ -171,7 +171,7 @@ def fetch(client, group_id: str, force: bool = False, ttl: int = DEFAULT_TTL) ->
     return _fetch_remote(client, group_id, force)
 
 
-def fetch_many(client, group_ids: list[str], force: bool = False) -> tuple[dict[str, dict], dict[str, Exception]]:
+def fetch_many(client, group_ids: list[str], force: bool = False, on_progress=None) -> tuple[dict[str, dict], dict[str, Exception]]:
     """并发拉取多个群，返回 (成功结果, 失败信息)。"""
     ids: list[str] = []
     for gid in group_ids:
@@ -185,13 +185,18 @@ def fetch_many(client, group_ids: list[str], force: bool = False) -> tuple[dict[
         return entries, errors
 
     workers = max(1, min(MAX_WORKERS, len(ids)))
+    if on_progress:
+        on_progress("读取各群成员名单", 0, len(ids))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(fetch, client, gid, force): gid for gid in ids}
-        for future, gid in futures.items():
+        for index, future in enumerate(as_completed(futures), 1):
+            gid = futures[future]
             try:
                 entries[gid] = future.result()
             except Exception as exc:  # noqa: BLE001 - 单个群失败不影响其它群
                 errors[gid] = exc
+            if on_progress:
+                on_progress("读取各群成员名单", index, len(ids))
     return entries, errors
 
 

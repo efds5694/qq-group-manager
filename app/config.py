@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -135,7 +136,7 @@ def public_view(config: dict) -> dict:
 
 def save_template(config: dict, template: dict) -> dict:
     template = dict(template)
-    template["id"] = template.get("id") or f"tpl-{len(config.get('templates', [])) + 1}"
+    template["id"] = template.get("id") or f"tpl-{uuid.uuid4().hex[:12]}"
     templates = [item for item in config.get("templates", []) if item.get("id") != template["id"]]
     templates.append(template)
     config["templates"] = templates

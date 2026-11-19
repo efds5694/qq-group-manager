@@ -1,0 +1,7 @@
+Colorcet 3.2.1 by the HoloViz developers and Peter Kovesi
+https://github.com/holoviz/colorcet/tree/v3.2.1
+https://colorcet.holoviz.org/user_guide/Categorical.html
+
+The glasbey_category10 RGB palette is copied as 8-bit RGB triples.
+It starts with the classic Category10 colors, then extends them using Glasbey color separation.
+The application blends colors for dark backgrounds; no runtime dependency or network access is required.

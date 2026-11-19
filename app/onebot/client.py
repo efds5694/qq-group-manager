@@ -89,6 +89,8 @@ class OneBotClient:
 
         if not ok:
             text, hint = explain(int(retcode) if isinstance(retcode, int) else -1, str(message))
+            if action == "send_private_msg" and message:
+                text, hint = str(message), None
             setattr(self, "_last_elapsed", elapsed_ms)
             return False, None, text, retcode, hint
 

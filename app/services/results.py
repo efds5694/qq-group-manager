@@ -67,5 +67,23 @@ class ResultStore:
         return {**metadata, "query_id": key, "total_rows": len(entry["rows"]), "offset": offset,
                 "created_at": entry["created_at"], "items": entry["rows"][offset:offset+limit]}
 
+    def selection(self, owner, key):
+        entry = self.get(owner, key)
+        return {"ids": [item["id"] for item in entry["result"]["items"]]}
+
+    def position(self, owner, key, row_id):
+        entry = self.get(owner, key)
+        return {"index": next((index for index, row in enumerate(entry["rows"])
+                               if row["kind"] == "record" and row["id"] == row_id), None)}
+
+    def plan(self, owner, key, kind, *, consume=False):
+        with self._lock:
+            entry = self.get(owner, key)
+            if entry["result"].get("entity") != kind:
+                raise AppError("预演类型不符，请重新预演")
+            if consume:
+                del self._items[key]
+            return entry["spec"]
+
 
 STORE = ResultStore()

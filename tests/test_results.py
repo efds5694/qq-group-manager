@@ -49,6 +49,15 @@ class ResultStoreTests(unittest.TestCase):
             with self.assertRaises(AppError) as error:self.store.get(other,first['query_id'])
             self.assertEqual(error.exception.code,'QUERY_EXPIRED')
 
+    def test_selection_returns_all_filtered_ids_without_bucket_headers_or_window_limit(self):
+        first=self.store.create(self.owner,self.result,{})
+        ids=self.store.selection(self.owner,first['query_id'])['ids']
+        self.assertEqual(ids,[str(i) for i in range(450)])
+        self.assertNotIn('bucket:0',ids)
+        self.assertEqual(len(first['items']),200)
+        with self.assertRaises(AppError):
+            self.store.selection(('other-account','99'),first['query_id'])
+
     def test_idle_expiry_and_lru_are_bounded(self):
         with patch('app.services.results.time.time',return_value=100):
             first=self.store.create(self.owner,self.result,{})
@@ -81,6 +90,18 @@ class ReportTests(unittest.TestCase):
 
     def spec(self,**changes):
         return {'source_group_ids':['10','11'],'target_group_ids':['20','21'],'status':'all',**changes}
+
+    def test_roster_selection_projects_one_qq_into_each_membership_and_exports_only_those_rows(self):
+        base = {'scope': {'group_ids': ['10', '11']}, 'roster_qqs': ['1'], 'project_selection': ['1'],
+                'fields': ['member.qq', 'group.group_id']}
+        people = api.api_query_start(request({**base, 'entity': 'people'}))
+        self.assertEqual(people['projected_selection'], ['1'])
+        detail = api.api_query_start(request({**base, 'entity': 'memberships'}))
+        self.assertEqual(set(detail['projected_selection']), {'10:1', '11:1'})
+        self.assertEqual(detail['total'], 2)
+        exported = api.api_query_export(request({'query_id': detail['query_id'], 'selected': ['11:1']}))
+        values = list(csv.reader(io.StringIO(exported.body.decode('utf-8-sig'))))
+        self.assertEqual(values[1:], [['1', '11']])
 
     def test_comparison_merges_sources_and_reports_each_target(self):
         data=api.api_members_compare(request(self.spec()))

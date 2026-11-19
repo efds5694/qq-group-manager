@@ -92,7 +92,7 @@ def normalize_member(member, detail, list_at=0):
     return result
 
 
-def prepare(client, self_id, spec):
+def prepare(client, self_id, spec, on_progress=None):
     entity = spec.get("entity", "memberships")
     if entity not in ("groups", "memberships", "people"):
         raise AppError("查询对象无效")
@@ -101,7 +101,8 @@ def prepare(client, self_id, spec):
         rule = {"op": "and", "rules": []}
     filters.validate(rule)
     scope = spec.get("scope") or {}
-    listing = groups.list_groups(client, self_id, force=bool(spec.get("refresh")))
+    progress_args = {"on_progress": on_progress} if on_progress else {}
+    listing = groups.list_groups(client, self_id, force=bool(spec.get("refresh")), **progress_args)
     all_map = {group["group_id"]: group for group in listing}
     ids = list(dict.fromkeys(str(gid) for gid in scope.get("group_ids", [])))
     if not ids and entity != "groups":
@@ -122,16 +123,18 @@ def prepare(client, self_id, spec):
         load_ids = list(dict.fromkeys(ids + source_ids))
     needs_members = entity != "groups" or filters.has_relation(rule) or any(
         leaf["field"].startswith(("member.", "person.")) for leaf in filters.leaves(rule))
-    entries, errors = members.fetch_many(client, load_ids, force=bool(spec.get("refresh"))) if needs_members else ({}, {})
+    entries, errors = members.fetch_many(client, load_ids, force=bool(spec.get("refresh")), **progress_args) if needs_members else ({}, {})
     if errors:
         raise AppError("部分群成员读取失败，未返回不完整结果", hint="、".join(f'{group_map[gid]["display_name"]}（{gid}）' for gid in errors))
     records, by_qq, by_group = [], {}, {gid: [] for gid in load_ids}
-    for gid in load_ids:
+    for group_index, gid in enumerate(load_ids, 1):
         for member in entries.get(gid, {}).get("members", []):
             record = {"id": f'{gid}:{member["qq"]}', "group": group_map[gid], "member": normalize_member(member, details[gid], entries[gid]["fetched_at"])}
             records.append(record)
             by_qq.setdefault(member["qq"], []).append({"group": record["group"], "member": record["member"]})
             by_group[gid].append(record)
+        if on_progress:
+            on_progress("整理群成员资料", group_index, len(load_ids))
     sources = source_ids
     targets = [gid for gid in ids if gid not in sources]
     id_set = set(ids)
@@ -212,6 +215,9 @@ def execute(dataset, spec, *, paginate=True):
     definitions = {item["id"]: item for item in dataset["fields"]}
     predicate = filters.Predicate(spec.get("filter"), definitions)
     base = dataset["group_rows"] if dataset["entity"] == "groups" else dataset["records"]
+    if dataset["entity"] != "groups" and spec.get("roster_qqs") is not None:
+        selected_qqs = set(spec["roster_qqs"])
+        base = [record for record in base if record["member"]["qq"] in selected_qqs]
     if dataset["entity"] == "groups":
         # 成员字段预设在群目录中表示“包含匹配成员的群”。
         rule = spec.get("filter") or {"rules": []}
@@ -308,12 +314,13 @@ def execute(dataset, spec, *, paginate=True):
         data_times = [group["fetched_at"] for group in dataset["groups"].values() if group.get("fetched_at")]
     return {"items": items, "total": total, "page": page, "size": size, "pages": pages, "fields": dataset["fields"], "buckets": buckets,
             "data_at": min(data_times) if data_times else None,
+            "data_at_end": max(data_times) if data_times else None,
             "stale": any(entry.get("stale") for entry in dataset["entries"].values()),
             "columns": columns, "people": len({row.get("member", {}).get("qq") for row in matched}) if dataset["entity"] != "groups" else 0,
             "memberships": len(matched) if dataset["entity"] != "groups" else 0,
             "groups": [{"group_id": gid, "name": group["display_name"],
                         "stale": bool(dataset["entries"].get(gid, {}).get("stale")),
-                        "fetched_at": dataset["entries"].get(gid, {}).get("fetched_at"),
+                        "fetched_at": dataset["entries"].get(gid, {}).get("fetched_at") or group.get("fetched_at"),
                         "collection": {action: {key: result[key] for key in ("status", "at", "error") if key in result}
                                        for action, result in dataset["details"][gid].get("group", {}).items()}}
                        for gid, group in dataset["groups"].items()]}

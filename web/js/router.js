@@ -1,19 +1,33 @@
 import { state } from './state.js';
 
-const ROUTES = ['groups', 'members', 'tasks', 'preferences'];
-const ALIASES = { connect: 'preferences', settings: 'groups', cards: 'members', 'cross-members': 'members' };
+const ROUTES = ['groups', 'members', 'members/rename', 'lists', 'lists/compare', 'tasks', 'preferences'];
+const ALIASES = new Map([
+  ['connect', 'preferences'], ['settings', 'groups'], ['cards', 'members/rename'],
+  ['cross-members', 'members'], ['rosters', 'lists'], ['groups/rosters', 'lists'],
+]);
 
 export function currentRoute() {
-  const raw = (window.location.hash || '').replace(/^#\/?/, '').split('?')[0];
+  const hash = window.location.hash || '';
+  const raw = hash.replace(/^#\/?/, '').split('?')[0];
   if (raw === 'cross-members') state.workbenchMode = 'people';
-  if (raw === 'cards') state.pendingRename = true;
   if (raw === 'settings') state.pendingGroupSettings = true;
-  return ALIASES[raw] || (ROUTES.includes(raw) ? raw : state.connected ? 'groups' : 'preferences');
+  const alias = ALIASES.get(raw);
+  if (alias) {
+    const query = hash.includes('?') ? hash.slice(hash.indexOf('?')) : '';
+    window.history.replaceState(window.history.state, '', `#/${alias}${query}`);
+    return alias;
+  }
+  return ROUTES.includes(raw) ? raw : state.connected ? 'groups' : 'preferences';
 }
 
-export function navigate(name) {
-  const route = ALIASES[name] || (ROUTES.includes(name) ? name : 'preferences');
-  const target = `#/${route}`;
+export function routeParams() {
+  return new URLSearchParams(window.location.hash.split('?')[1] || '');
+}
+
+export function navigate(name, params) {
+  const route = ROUTES.includes(name) || ALIASES.has(name) ? name : 'preferences';
+  const suffix = params ? '?' + new URLSearchParams(params) : '';
+  const target = `#/${route}${suffix}`;
   if (window.location.hash === target) window.dispatchEvent(new HashChangeEvent('hashchange'));
   else window.location.hash = target;
 }

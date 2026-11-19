@@ -6,6 +6,7 @@ import threading
 import time
 import csv
 import io
+import uuid
 
 from . import config as config_mod
 from .core import exporter, store, fields
@@ -13,10 +14,11 @@ from .core.errors import AppError
 from .onebot import adapters, probe
 from .onebot.client import OneBotClient
 from .server import Request, Response, Router
-from .services import cards, groups, groupsettings, jobs, members, query, collection, presets, rename, results, comparison
+from .services import cards, groups, groupsettings, jobs, members, query, collection, presets, rename, results, comparison, rosters, roster_match, member_actions
 
 _STATE: dict = {"client": None, "key": None, "session": None}
 _LOCK = threading.RLock()
+_SETTINGS_PREVIEWS: dict[str, dict] = {}
 
 
 # ------------------------------------------------------------------ 基础设施
@@ -39,6 +41,7 @@ def _active_client() -> tuple[OneBotClient, dict]:
 def _reset_client() -> None:
     with _LOCK:
         _STATE.update({"client": None, "key": None, "session": None})
+        _SETTINGS_PREVIEWS.clear()
     groups.invalidate()
     members.invalidate()
 
@@ -132,19 +135,32 @@ def api_config(request: Request):
     return view
 
 
-def _query_data(spec):
+def _query_data(spec, on_progress=None):
     session = _session()
     client, _ = _active_client()
-    dataset = query.prepare(client, str(session["login"]["user_id"]), spec)
+    dataset = query.prepare(client, str(session["login"]["user_id"]), spec,
+                            **({"on_progress": on_progress} if on_progress else {}))
     pending = query.pending_collection(client, dataset, spec)
     return dataset, pending
 
 
+def _background(request, title, work):
+    if not request.b("background"):
+        return work(None)
+    client, _ = _active_client()
+    return {"pending": True, "job": jobs.MANAGER.submit(
+        client, "load", [{"action": "read", "run": work}], title=title, interval=0, retries=0)}
+
+
 def api_query(request: Request):
-    dataset, pending = _query_data(request.body)
-    if pending:
-        return {"pending": True, "job": pending, "fields": dataset["fields"]}
-    return query.execute(dataset, request.body)
+    def read(progress):
+        dataset, pending = _query_data(request.body, progress)
+        if pending:
+            return {"pending": True, "job": pending, "fields": dataset["fields"]}
+        if progress:
+            progress("筛选与整理结果")
+        return query.execute(dataset, request.body)
+    return _background(request, "读取资料", read)
 
 
 def _result_owner():
@@ -154,20 +170,175 @@ def _result_owner():
 
 
 def api_query_start(request: Request):
-    dataset, pending = _query_data(request.body)
-    if pending:
-        return {"pending": True, "job": pending}
-    result = query.execute(dataset, request.body, paginate=False)
-    result["entity"] = dataset["entity"]
-    result["matrix"] = bool(request.b("matrix"))
-    return results.STORE.create(_result_owner(), result, request.body)
+    def read(progress):
+        dataset, pending = _query_data(request.body, progress)
+        if pending:
+            return {"pending": True, "job": pending}
+        if progress:
+            progress("筛选与整理结果")
+        result = query.execute(dataset, request.body, paginate=False)
+        result["entity"] = dataset["entity"]
+        result["matrix"] = bool(request.b("matrix"))
+        if request.b("project_selection") is not None and dataset["entity"] in ("people", "memberships"):
+            accounts = set(request.b("project_selection"))
+            result["projected_selection"] = [row["id"] for row in result["items"] if row["qq"] in accounts]
+        return results.STORE.create(_result_owner(), result, request.body)
+    title = "读取群列表" if request.b("entity") == "groups" else "读取成员名单"
+    return _background(request, title, read)
 
 
 def api_result_window(request: Request, query_id: str):
     return results.STORE.window(_result_owner(), query_id, request.q("offset", "0"), request.q("limit", "200"))
 
 
+def api_result_selection(request: Request, query_id: str):
+    return results.STORE.selection(_result_owner(), query_id)
+
+
+def api_result_position(request: Request, query_id: str):
+    return results.STORE.position(_result_owner(), query_id, request.q("id"))
+
+
 def api_members_compare(request: Request):
+    return _background(request, "读取并核对成员名单", lambda progress: _members_compare(request, progress))
+
+
+def api_match_roster(request: Request):
+    owner = _result_owner()
+    client, _ = _active_client()
+    sources = member_actions.group_ids(request.b("source_ids"))
+
+    def read(progress):
+        imported = roster_match.read(request.body)
+        names, lists = member_actions.read_sources(client, owner[1], sources, progress)
+        if progress:
+            progress("匹配姓名、班级、学号和手机号")
+        rows, accounts = roster_match.match(imported, names, lists)
+        preview = results.STORE.create(owner, {"entity": "roster_match", "items": []},
+                                       {"rows": rows, "accounts": list(accounts), "source_ids": sources})
+        return {"preview_id": preview["query_id"], "rows": rows}
+
+    return _background(request, "按名单匹配 QQ账号", read)
+
+
+def api_match_roster_confirm(request: Request):
+    plan = results.STORE.plan(_result_owner(), request.b("preview_id", ""), "roster_match")
+    qqs = roster_match.confirm(plan["rows"], set(plan["accounts"]), request.b("assignments"))
+    return {"qqs": qqs, "source_ids": plan["source_ids"]}
+
+
+def api_match_roster_export(request: Request):
+    plan = results.STORE.plan(_result_owner(), request.b("preview_id", ""), "roster_match")
+    confirmed = request.b("assignments") or {}
+    if not isinstance(confirmed, dict):
+        raise AppError("无效的确认名单")
+    statuses = {"matched": "尚未确认", "review": "仅姓名相同", "conflict": "需要核对", "missing": "未匹配"}
+    columns = ["name", "class", "student", "phone", "input_qq"]
+    rows = [[row[key] for key in columns] + [statuses[row["status"]]]
+            for row in plan["rows"] if row["id"] not in confirmed]
+    return _deliver(["姓名", "班级", "学号", "手机号（遮盖）", "输入QQ号", "匹配状态"],
+                    rows, "未确认名单", "csv")
+
+
+def api_member_action_preview(request: Request):
+    owner = _result_owner()
+    session = _session()
+    client, _ = _active_client()
+    record = None
+    if request.b("tracking_id"):
+        roster = rosters.load(owner[1], request.b("tracking_id"))
+        if not roster.get("source_ids") or request.b("group_id") != roster["group_id"]:
+            raise AppError("请在原目标群继续邀请")
+        sources = roster["source_ids"]
+        roster_members = {member["qq"]: member for member in roster["members"]}
+        selected = request.b("selected")
+        if selected is not None and (not isinstance(selected, list) or any(
+                not isinstance(qq, str) or qq not in roster_members for qq in selected)):
+            raise AppError("部分勾选已不在跟踪计划中")
+        recipients = list(roster_members) if selected is None else list(dict.fromkeys(selected))
+        record = {"id": roster["id"], "delivery": {
+            qq: member.get("delivery", "pending") for qq, member in roster_members.items()}}
+    else:
+        entry = results.STORE.get(owner, request.b("query_id", ""))
+        sources, recipients = member_actions.selected_accounts(entry, request.b("selected"))
+
+    def read(progress):
+        plan = member_actions.preview(client, owner[1], session["adapter"], sources, recipients,
+                                      request.body, progress, record)
+        preview = results.STORE.create(owner, {"entity": "member_action", "items": []}, plan)
+        return {**plan, "preview_id": preview["query_id"]}
+
+    return _background(request, "核对成员操作范围", read)
+
+
+def api_member_action_execute(request: Request):
+    owner = _result_owner()
+    client, _ = _active_client()
+    key = request.b("preview_id", "")
+    plan = results.STORE.plan(owner, key, "member_action")
+    roster_id = plan["tracking_id"]
+    create_tracking = plan["operation"] == "invite" and not roster_id
+    track_only = request.b("track_only") is True
+    if track_only:
+        if not create_tracking:
+            raise AppError("此预演无法新建入群跟踪计划")
+    elif not plan["ready"] or plan["link_error"]:
+        raise AppError("本次预演没有可执行的成员")
+    if create_tracking:
+        entry, actual = rosters._latest(client, owner[1], plan["group_id"], None)
+    plan = results.STORE.plan(owner, key, "member_action", consume=True)
+    if create_tracking:
+        roster_id = rosters.create_invitation(owner[1], plan["group_name"], plan["group_id"], plan["source_ids"],
+                                              [row["qq"] for row in plan["rows"]], entry, actual,
+                                              pending_delivery="manual" if track_only else "pending")
+    if track_only:
+        return {"tracking_id": roster_id}
+    task = jobs.MANAGER.submit(
+        client, "member_action", member_actions.tasks(client, owner[1], plan, roster_id),
+        title=f'{member_actions.LABELS[plan["operation"]]} · {plan["group_name"]}', interval=_interval(None),
+        retries=0, meta={"group_id": plan["group_id"], "tracking_id": roster_id})
+    return {"job": task, "tracking_id": roster_id}
+
+
+# ------------------------------------------------------------------ 名单建群与入群跟踪
+def api_rosters(request: Request):
+    return {"rosters": rosters.list_rosters(_session()["login"]["user_id"])}
+
+
+def api_roster_import(request: Request):
+    draft = rosters.parse(request.body)
+    return results.STORE.create(_result_owner(), rosters.build(draft, {}), {})
+
+
+def api_roster_create(request: Request):
+    return rosters.create(_session()["login"]["user_id"], request.body)
+
+
+def api_roster_query(request: Request, roster_id: str):
+    roster = rosters.load(_session()["login"]["user_id"], roster_id)
+    return results.STORE.create(_result_owner(), rosters.build(roster, request.body), request.body)
+
+
+def api_roster_bind(request: Request, roster_id: str):
+    account_id = _session()["login"]["user_id"]
+    client, _ = _active_client()
+    return _background(request, "绑定群聊并核对入群名单", lambda progress:
+                       rosters.bind(client, account_id, roster_id, request.b("group_id"), progress))
+
+
+def api_roster_sync(request: Request, roster_id: str):
+    account_id = _session()["login"]["user_id"]
+    client, _ = _active_client()
+    return _background(request, "核对最新入群名单", lambda progress:
+                       rosters.sync(client, account_id, roster_id, progress))
+
+
+def api_roster_delete(request: Request, roster_id: str):
+    rosters.delete(_session()["login"]["user_id"], roster_id)
+    return {"deleted": True}
+
+
+def _members_compare(request, progress=None):
     sources = list(dict.fromkeys(str(gid) for gid in request.b("source_group_ids", [])))
     targets = list(dict.fromkeys(str(gid) for gid in request.b("target_group_ids", [])))
     if not sources or not targets:
@@ -175,7 +346,7 @@ def api_members_compare(request: Request):
     spec = {"entity": "memberships", "scope": {"group_ids": sources, "source_group_ids": targets,
              "show_remark": request.b("show_remark", True)}, "filter": request.b("source_filter"),
              "refresh": bool(request.b("refresh"))}
-    dataset, pending = _query_data(spec)
+    dataset, pending = _query_data(spec, progress)
     if pending:
         return {"pending": True, "job": pending}
     if any(gid not in dataset["all_groups"] for gid in targets):
@@ -242,18 +413,27 @@ def api_delete_preset(request: Request, preset_id: str):
 
 
 def api_collect(request: Request):
+    return _background(request, "准备资料补全范围", lambda progress: _collect(request, progress))
+
+
+def _collect(request, progress=None):
     session = _session()
     client, _ = _active_client()
     spec = {"entity": "memberships", "scope": {"group_ids": request.b("group_ids") or []}}
-    dataset = query.prepare(client, str(session["login"]["user_id"]), spec)
+    dataset = query.prepare(client, str(session["login"]["user_id"]), spec,
+                            **({"on_progress": progress} if progress else {}))
     return {"job": collection.submit(client, dataset["entries"], dataset["ids"],
                                      retry_failed=bool(request.b("retry_failed")))}
 
 
 def api_rename_preview(request: Request):
+    return _background(request, "读取最新名单并预演群昵称", lambda progress: _rename_preview(request, progress))
+
+
+def _rename_preview(request, progress=None):
     spec = request.b("query") or {}
     spec = {**spec, "refresh": True}
-    dataset, pending = _query_data(spec)
+    dataset, pending = _query_data(spec, progress)
     if pending:
         return {"pending": True, "job": pending}
     return rename.preview(dataset, {**request.body, "query": spec}, str(_session()["login"]["user_id"]),
@@ -317,6 +497,19 @@ def api_groups(request: Request):
     client, _ = _active_client()
     data = groups.list_groups(client, session["login"]["user_id"], force=request.q("refresh") == "1")
     return {"groups": data, "self": session["login"]}
+
+
+def api_groups_load(request: Request):
+    def read(progress):
+        session = _session()
+        client, _ = _active_client()
+        self_id = str(session["login"]["user_id"])
+        listing = groups.list_groups(client, self_id, force=bool(request.b("refresh")), on_progress=progress)
+        if request.b("show_remark", True):
+            remarks, _ = groups.fetch_remarks(client, self_id, [group["group_id"] for group in listing], on_progress=progress)
+            listing = [{**group, "group_remark": remarks.get(group["group_id"]) or group.get("group_remark", "")} for group in listing]
+        return {"groups": listing, "self": session["login"]}
+    return _background(request, "读取群列表与群资料", read)
 
 
 def api_group_remarks(request: Request):
@@ -712,35 +905,58 @@ def api_cards_execute(request: Request):
 
 # ------------------------------------------------------------------ 群设置模板
 def api_settings_preview(request: Request):
-    group_ids = [str(item) for item in (request.b("group_ids") or [])]
+    return _background(request, "预演各群设置差异", lambda progress: _settings_preview(request, progress))
+
+
+def _settings_preview(request, progress=None):
+    group_ids = list(dict.fromkeys(str(item) for item in (request.b("group_ids") or [])))
     if not group_ids:
         raise AppError("请至少选择一个群")
     template = request.b("template") or {}
-    ctx = _context(group_ids[0])
-    client = ctx["client"]
-    all_groups = groups.list_groups(client, ctx["self_id"])
+    session = _session()
+    client, _ = _active_client()
+    self_id = str(session["login"]["user_id"])
+    all_groups = groups.list_groups(client, self_id)
     targets = [groups.find(all_groups, gid) for gid in group_ids]
-    adapter = adapters.get_adapter(_session()["adapter"])
-    return groupsettings.build_diff(client, targets, template, ctx["caps"], adapter)
+    adapter = adapters.get_adapter(session["adapter"])
+    diff = groupsettings.build_diff(client, targets, template, session["capabilities"], adapter, self_id, progress)
+    preview_id = uuid.uuid4().hex
+    with _LOCK:
+        # 预演只保留在内存；固定执行用户看过的目标值。
+        now = time.time()
+        for key in list(_SETTINGS_PREVIEWS):
+            if now - _SETTINGS_PREVIEWS[key]["at"] > 1800:
+                del _SETTINGS_PREVIEWS[key]
+        if len(_SETTINGS_PREVIEWS) >= 20:
+            del _SETTINGS_PREVIEWS[next(iter(_SETTINGS_PREVIEWS))]
+        _SETTINGS_PREVIEWS[preview_id] = {"at": now, "namespace": client.cache_namespace,
+                                          "adapter": session["adapter"], "group_ids": group_ids, "diff": diff}
+    return {**diff, "preview_id": preview_id}
 
 
 def api_settings_execute(request: Request):
-    group_ids = [str(item) for item in (request.b("group_ids") or [])]
-    template = request.b("template") or {}
-    if not group_ids:
-        raise AppError("请至少选择一个群")
-    if len(group_ids) * 6 > 100 and not request.b("confirmed"):
-        raise AppError("即将对多个群批量套用设置", hint="请确认目标群无误后重试。")
-
-    ctx = _context(group_ids[0])
-    adapter = adapters.get_adapter(_session()["adapter"])
-    all_groups = groups.list_groups(ctx["client"], ctx["self_id"])
+    preview_id = request.b("preview_id") or ""
+    with _LOCK:
+        plan = _SETTINGS_PREVIEWS.get(preview_id)
+    session = _session()
+    client, _ = _active_client()
+    if not plan or time.time() - plan["at"] > 1800 or plan["namespace"] != client.cache_namespace or plan["adapter"] != session["adapter"]:
+        raise AppError("群设置预演已失效", hint="请重新预演并核对差异。")
+    group_ids = plan["group_ids"]
+    diff = plan["diff"]
+    self_id = str(session["login"]["user_id"])
+    adapter = adapters.get_adapter(session["adapter"])
+    all_groups = groups.list_groups(client, self_id)
     targets = [groups.find(all_groups, gid) for gid in group_ids]
-    diff = groupsettings.build_diff(ctx["client"], targets, template, ctx["caps"], adapter)
-
     task_list = groupsettings.build_tasks(diff["groups"], diff["template"])
     if not task_list:
         raise AppError("没有需要变更的设置", hint="模板内容与当前群设置一致，或接口不支持。")
+    current = groupsettings.build_diff(client, targets, diff["template"], session["capabilities"], adapter, self_id)
+    if groupsettings.build_tasks(current["groups"]) != task_list:
+        raise AppError("群设置或管理员状态已变化", hint="请重新预演，核对最新差异后执行。")
+    with _LOCK:
+        if _SETTINGS_PREVIEWS.pop(preview_id, None) is None:
+            raise AppError("本次预演已经提交", hint="请在任务中心查看执行进度。")
 
     snapshot = store.save_snapshot(
         "settings",
@@ -749,14 +965,14 @@ def api_settings_execute(request: Request):
             "group_name": "、".join(group["group_name"] for group in diff["groups"])[:60],
             "note": diff["template"]["name"],
             "entries": [
-                {"group_id": group["group_id"], "group_name": group["group_name"]} for group in diff["groups"]
+                {"group_id": group["group_id"], "group_name": group["group_name"], "fields": group["fields"]} for group in diff["groups"]
             ],
         },
         note=f"套用模板：{diff['template']['name']}",
     )
 
     job = jobs.MANAGER.submit(
-        ctx["client"],
+        client,
         "settings",
         task_list,
         title=f"套用模板「{diff['template']['name']}」· {len(diff['groups'])} 个群",
@@ -764,7 +980,6 @@ def api_settings_execute(request: Request):
         retries=int(_config().get("batch", {}).get("retries", 2)),
         meta={"groups": group_ids, "snapshot_id": snapshot["id"]},
     )
-    groups.invalidate()
     return {"job": job, "snapshot": snapshot, "diff": diff, "planned": len(task_list)}
 
 
@@ -816,7 +1031,10 @@ def api_logs(request: Request):
 
 # ------------------------------------------------------------------ 模板管理
 def api_save_template(request: Request):
-    template = request.b("template") or {}
+    raw = request.b("template") or {}
+    template = groupsettings.normalize_template(raw)
+    if raw.get("id"):
+        template["id"] = str(raw["id"])
     cfg = _config()
     saved = config_mod.save_template(cfg, template)
     return {"template": saved, "config": config_mod.public_view(cfg)}
@@ -834,7 +1052,21 @@ def build_router() -> Router:
     router.add("POST", r"^/api/query$", api_query)
     router.add("POST", r"^/api/query/start$", api_query_start)
     router.add("GET", r"^/api/query/results/(?P<query_id>[a-f0-9]+)$", api_result_window)
+    router.add("GET", r"^/api/query/results/(?P<query_id>[a-f0-9]+)/selection$", api_result_selection)
+    router.add("GET", r"^/api/query/results/(?P<query_id>[a-f0-9]+)/position$", api_result_position)
     router.add("POST", r"^/api/members/compare$", api_members_compare)
+    router.add("POST", r"^/api/members/match-roster$", api_match_roster)
+    router.add("POST", r"^/api/members/match-roster/confirm$", api_match_roster_confirm)
+    router.add("POST", r"^/api/members/match-roster/export$", api_match_roster_export)
+    router.add("POST", r"^/api/members/actions/preview$", api_member_action_preview)
+    router.add("POST", r"^/api/members/actions/execute$", api_member_action_execute)
+    router.add("GET", r"^/api/rosters$", api_rosters)
+    router.add("POST", r"^/api/rosters/import$", api_roster_import)
+    router.add("POST", r"^/api/rosters$", api_roster_create)
+    router.add("POST", r"^/api/rosters/(?P<roster_id>[a-f0-9]{32})/query$", api_roster_query)
+    router.add("POST", r"^/api/rosters/(?P<roster_id>[a-f0-9]{32})/bind$", api_roster_bind)
+    router.add("POST", r"^/api/rosters/(?P<roster_id>[a-f0-9]{32})/sync$", api_roster_sync)
+    router.add("DELETE", r"^/api/rosters/(?P<roster_id>[a-f0-9]{32})$", api_roster_delete)
     router.add("POST", r"^/api/query/export$", api_query_export)
     router.add("GET", r"^/api/fields$", api_fields)
     router.add("GET", r"^/api/filter-presets$", api_presets)
@@ -851,6 +1083,7 @@ def build_router() -> Router:
     router.add("GET", r"^/api/capabilities$", api_capabilities)
 
     router.add("GET", r"^/api/groups$", api_groups)
+    router.add("POST", r"^/api/groups/load$", api_groups_load)
     router.add("GET", r"^/api/groups/remarks$", api_group_remarks)
     router.add("GET", r"^/api/groups/(?P<gid>[^/]+)/members$", api_members)
     router.add("GET", r"^/api/groups/(?P<gid>[^/]+)/export$", api_export)
